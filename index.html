@@ -64,6 +64,43 @@
       line-height: 1.45;
       -webkit-font-smoothing: antialiased;
     }
+    /* Restoring a Firebase session is async, so the sign-in form used to flash on every
+       reload. The splash holds the screen until we actually know whether anyone is signed in. */
+    .app-boot {
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at 12% 18%, rgba(183,122,0,.16), transparent 31%),
+        radial-gradient(circle at 88% 82%, rgba(36,107,253,.14), transparent 34%),
+        linear-gradient(145deg, var(--bg), color-mix(in srgb,var(--bg) 82%,#fff3cf));
+      transition: opacity .32s ease;
+    }
+    .app-boot.is-leaving { opacity: 0; pointer-events: none; }
+    .app-boot-inner { display: grid; justify-items: center; gap: 16px; }
+    .app-boot-mark {
+      width: 96px; height: 62px;
+      display: grid; place-items: center;
+      border: 1px solid #e5cf91; border-radius: 18px;
+      background: linear-gradient(145deg,#fff,#fff4cf);
+      color: #9a6800; font-size: 12px; font-weight: 950; letter-spacing: .11em;
+      box-shadow: 0 14px 35px rgba(148,99,0,.16);
+      animation: bootPulse 1.6s ease-in-out infinite;
+    }
+    .app-boot-bar { width: 148px; height: 3px; border-radius: 999px; background: color-mix(in srgb,var(--text) 12%,transparent); overflow: hidden; }
+    .app-boot-bar span { display: block; width: 40%; height: 100%; border-radius: 999px; background: linear-gradient(90deg,transparent,#b77a00,transparent); animation: bootSlide 1.1s ease-in-out infinite; }
+    .app-boot p { margin: 0; color: var(--muted); font-size: 12px; letter-spacing: .02em; }
+    @keyframes bootPulse { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
+    @keyframes bootSlide { 0% { transform: translateX(-120%); } 100% { transform: translateX(370%); } }
+    @keyframes riseIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+    .auth-gate:not([hidden]) .auth-shell { animation: riseIn .34s cubic-bezier(.2,.7,.2,1) both; }
+    .app-shell:not([hidden]) .main { animation: riseIn .3s cubic-bezier(.2,.7,.2,1) both; }
+    @media (prefers-reduced-motion: reduce) {
+      .app-boot-mark, .app-boot-bar span { animation: none; }
+      .auth-gate:not([hidden]) .auth-shell, .app-shell:not([hidden]) .main { animation: none; }
+    }
     .auth-gate {
       min-height: 100vh;
       display: grid;
@@ -91,8 +128,11 @@
     .auth-status.success { border-color:color-mix(in srgb,var(--success) 35%,var(--line)); background:var(--success-soft); color:var(--success); }
     button, input, select, textarea { font: inherit; }
     button { color: inherit; }
-    .profile { cursor: pointer; border: 1px solid transparent; border-radius: 12px; padding: 6px 8px; }
+    /* background must be explicit: a bare <button> otherwise takes the UA's light ButtonFace,
+       which in dark mode left the near-white profile name invisible on a pale box. */
+    .profile { cursor: pointer; border: 1px solid transparent; border-radius: 12px; padding: 6px 8px; background: transparent; color: var(--text); }
     .profile:hover { border-color: var(--line); background: var(--surface-2); }
+    .profile strong { color: var(--text); }
     a { color: inherit; text-decoration: none; }
     svg { display: block; }
     .app-shell { min-height: 100vh; }
@@ -1001,19 +1041,45 @@
     .h-bar-row { display: grid; grid-template-columns: 85px 1fr 48px; gap: 10px; align-items: center; font-size: 11px; }
     .h-bar-track { height: 9px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
     .h-bar-fill { height: 100%; background: var(--accent); border-radius: inherit; }
-    .aging-grid { display: grid; grid-template-columns: repeat(6,minmax(110px,1fr)); gap: 10px; }
+    .aging-grid { display: grid; grid-template-columns: repeat(6,minmax(120px,1fr)); gap: 12px; }
+    /* Same visual language as the dashboard KPI cards, with the accent shifting from green to
+       red across the buckets so stock age reads at a glance. */
     .aging-card {
-      border: 1px solid var(--line);
-      border-radius: 11px;
-      padding: 13px;
-      background: var(--surface);
+      --aging-accent: var(--accent);
+      position: relative;
+      overflow: hidden;
+      border: 1px solid color-mix(in srgb,var(--aging-accent) 20%,var(--line));
+      border-radius: var(--radius);
+      padding: 15px 26px 15px 15px;
+      min-height: 106px;
+      background: linear-gradient(145deg,var(--surface),color-mix(in srgb,var(--aging-accent) 6%,var(--surface)));
+      box-shadow: var(--shadow-sm);
       text-align: left;
       cursor: pointer;
-      transition: border .15s, transform .15s;
+      transition: transform .22s cubic-bezier(.2,.7,.2,1), border-color .22s ease, box-shadow .22s ease;
     }
-    .aging-card:hover, .aging-card.active { border-color: var(--accent); transform: translateY(-1px); }
-    .aging-card strong { display: block; font-size: 18px; margin: 6px 0 1px; }
-    .aging-card span { color: var(--muted); font-size: 10px; }
+    .aging-card::after {
+      content: "";
+      position: absolute;
+      width: 66px; height: 66px;
+      right: -22px; top: -22px;
+      border-radius: 50%;
+      background: color-mix(in srgb,var(--aging-accent) 14%,var(--surface));
+      transition: transform .24s ease;
+    }
+    .aging-card > * { position: relative; z-index: 1; }
+    .aging-card span { color: var(--muted); font-size: 11px; }
+    .aging-card span:first-child { font-size: 10px; font-weight: 750; text-transform: uppercase; letter-spacing: .055em; }
+    .aging-card strong { display: block; font-size: 22px; font-weight: 800; letter-spacing: -.03em; margin: 11px 0 3px; color: var(--text); }
+    .aging-card:nth-child(1) { --aging-accent: #138a61; }
+    .aging-card:nth-child(2) { --aging-accent: #1686a0; }
+    .aging-card:nth-child(3) { --aging-accent: #246bfd; }
+    .aging-card:nth-child(4) { --aging-accent: #b77a00; }
+    .aging-card:nth-child(5) { --aging-accent: #d26d2f; }
+    .aging-card:nth-child(6) { --aging-accent: #d23f4f; }
+    .aging-card:hover { transform: translateY(-3px); border-color: var(--aging-accent); box-shadow: 0 16px 38px color-mix(in srgb,var(--aging-accent) 13%,transparent), var(--shadow-sm); }
+    .aging-card:hover::after { transform: scale(1.35); }
+    .aging-card.active { border-color: var(--aging-accent); box-shadow: inset 0 0 0 1px var(--aging-accent), var(--shadow-sm); }
     .stats-strip {
       display: grid;
       grid-template-columns: repeat(auto-fit,minmax(120px,1fr));
@@ -1203,9 +1269,10 @@
     .mobile-list-card h3 { margin: 0 0 4px; font-size: 14px; }
     .mobile-list-card p { margin: 2px 0; color: var(--muted); font-size: 11px; }
     .mobile-list-card .inline-actions { margin-top: 11px; }
-    .mobile-list-card, .mobile-kpi, .aging-card { transition: transform .2s cubic-bezier(.2,.7,.2,1), border-color .2s ease, box-shadow .2s ease, background-color .2s ease; }
+    .mobile-list-card, .mobile-kpi { transition: transform .2s cubic-bezier(.2,.7,.2,1), border-color .2s ease, box-shadow .2s ease, background-color .2s ease; }
     @media (hover:hover) and (pointer:fine) {
-      .card:hover, .mobile-list-card:hover, .mobile-kpi:hover, .aging-card:hover {
+      /* aging cards are excluded: they carry their own per-bucket accent hover above */
+      .card:hover, .mobile-list-card:hover, .mobile-kpi:hover {
         transform: translateY(-2px);
         border-color: color-mix(in srgb,var(--accent) 36%,var(--line));
         box-shadow: 0 15px 34px color-mix(in srgb,var(--accent) 10%,transparent), var(--shadow-sm);
@@ -1371,7 +1438,14 @@
   </style>
 </head>
 <body>
-  <div class="auth-gate" id="auth-gate">
+  <div class="app-boot" id="app-boot">
+    <div class="app-boot-inner">
+      <div class="app-boot-mark">INFINIAA</div>
+      <div class="app-boot-bar"><span></span></div>
+      <p id="app-boot-note">Restoring your session…</p>
+    </div>
+  </div>
+  <div class="auth-gate" id="auth-gate" hidden>
     <div class="auth-shell">
       <div class="auth-brand"><div class="auth-brand-mark">INFINIAA</div><div class="auth-brand-copy"><h1>IMEI Flow</h1><p>Stock · Sales · Billing</p></div></div>
       <section class="auth-card">
@@ -7098,12 +7172,24 @@
     const setFormBusy=(form,busy)=>{
       $$('input,button,select,textarea',form).forEach(control=>{control.disabled=busy;});
     };
+    const setBootNote=text=>{const note=$("#app-boot-note");if(note)note.textContent=text;};
+    // If the network stalls, say so rather than spinning silently forever.
+    const bootStallTimer=setTimeout(()=>setBootNote("Still connecting — check your internet connection."),15000);
+    // Fades the splash out once, then leaves it out for the rest of the session.
+    const dismissBootSplash=()=>{
+      clearTimeout(bootStallTimer);
+      const splash=$("#app-boot");
+      if(!splash||splash.hidden||splash.classList.contains("is-leaving"))return;
+      splash.classList.add("is-leaving");
+      setTimeout(()=>{splash.hidden=true;},320);
+    };
     const showSignedOut=(message="",type="")=>{
       dataService.stopRealtime();
       profileUnsubscribe?.();profileUnsubscribe=null;
       currentUser=null;currentUserId="";currentRole="";startupUid="";
       document.body.dataset.role="";document.body.dataset.fieldRole="false";
       $("#app-shell").hidden=true;$("#auth-gate").hidden=false;
+      dismissBootSplash();
       setAuthMessage(message,type);
     };
     const loadFirebaseProfile=async uidValue=>{
@@ -7134,7 +7220,7 @@
         const db=await dataService.getDatabase(),cloudProfile=db.users.find(item=>item.id===user.uid&&item.status==="ACTIVE");
         if(!cloudProfile)throw new Error("Your account could not be loaded. Contact the Administrator.");
         currentUser=cloudProfile;currentRole=cloudProfile.role;
-        $("#auth-gate").hidden=true;$("#app-shell").hidden=false;setAuthMessage();
+        $("#auth-gate").hidden=true;$("#app-shell").hidden=false;dismissBootSplash();setAuthMessage();
         const savedTheme=window.localStorage.getItem(THEME_KEY);
         applyTheme(savedTheme?savedTheme==="dark":Boolean(db.settings.darkMode));
         applyRole();
@@ -7168,6 +7254,7 @@
     applyTheme(window.localStorage.getItem(THEME_KEY)==="dark");
     authPersistenceReady.then(()=>onAuthStateChanged(firebaseAuth,async user=>{
       if(!user){const notice=pendingAuthMessage;pendingAuthMessage=null;showSignedOut(notice?.message||"",notice?.type||"");return;}
+      setBootNote("Opening your account…");
       setAuthMessage("Opening your account…");
       try{await startAuthenticatedApp(user);}
       catch(error){console.error(error);pendingAuthMessage={message:friendlySignInError(error),type:"error"};await signOut(firebaseAuth);}
