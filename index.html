@@ -1954,7 +1954,7 @@
       },
       async save(baselines, expectedRevision, next, scope) {
         const operations = this.buildOperations(baselines, next, scope);
-        const rootData = { meta: next.meta, settings: next.settings };
+        const rootData = { meta: next.meta, settings: next.__rootSettings || next.settings };
         if (operations.length <= 440) {
           await runTransaction(firestore, async transaction => {
             const rootSnapshot = await transaction.get(companyRef);
@@ -2028,6 +2028,10 @@
       return database;
     };
 
+    // Which collections are actually loaded while a normalise pass runs. Cross-collection
+    // pruning must be skipped for anything that is not present, or a lazily-loaded screen
+    // would look like an empty collection and destroy real records.
+    let normalizeScope = null;
     const normalizeActivationData = database => {
       if (!database || typeof database !== "object") return database;
       database.activations ||= [];
@@ -2060,6 +2064,15 @@
           importedAt: latest.importedAt, sourceFile: latest.sourceFile
         } : { status: "NOT_ACTIVATED", activationDate: "", importedAt: "", sourceFile: "" };
       });
+      // These two lists are pruned against inventory. When inventory is not loaded, an empty
+      // array here would look like "no IMEI matches" and silently drop every activation
+      // record — and the next import would then delete them from the cloud. Only prune when
+      // inventory is genuinely present in the working set.
+      const canPruneAgainstInventory = !normalizeScope || normalizeScope.has("inventory");
+      if (!canPruneAgainstInventory) {
+        database.activations = [...latestByIMEI.values()].sort((a, b) => String(b.importedAt).localeCompare(String(a.importedAt)));
+        return database;
+      }
       const linkedIMEIs = new Set((database.inventory || []).filter(item => item.activation?.status === "ACTIVATED").map(item => item.imei));
       database.activations = [...latestByIMEI.values()].filter(row => linkedIMEIs.has(row.imei)).sort((a, b) => String(b.importedAt).localeCompare(String(a.importedAt)));
       const latestUnmatched = new Map();
@@ -2398,10 +2411,16 @@
       const loadedSet = new Set();      // collections with at least one snapshot delivered
       const pendingAttach = new Map();  // collection name -> in-flight first-snapshot promise
 
+      // The stored settings map is kept verbatim alongside the merged one. Firestore rules
+      // require a non-admin write to send settings back byte-identical to what is stored, but
+      // the app fills in defaults and normalises operatingMode for its own use — writing that
+      // merged version back would fail every Warehouse and Salesman write with permission-denied.
+      let storedSettings = null;
       const applyRootData = root => {
         if (!root) throw new Error("Your account is not ready. Contact the Administrator.");
         if (root.meta?.schemaVersion !== SCHEMA_VERSION) throw new Error("The application needs an update. Contact the Administrator.");
         database.meta = { ...createEmptyDatabase().meta, ...(root.meta || {}) };
+        storedSettings = root.settings && typeof root.settings === "object" ? clone(root.settings) : {};
         database.settings = { ...createEmptyDatabase().settings, ...(root.settings || {}) };
         database.meta.revision = Number(database.meta.revision) || 0;
         database.settings.operatingMode = operatingModeOf(database.settings);
@@ -2425,8 +2444,11 @@
       };
       const renormalize = () => {
         const before = new Map([...indexes.keys()].map(name => [name, database[name]]));
-        normalizeDatabase(database);
-        database.models.forEach(model => { if (!clean(model.productName)) model.productName = productMasterName(model); });
+        normalizeScope = loadedSet;
+        try {
+          normalizeDatabase(database);
+          database.models.forEach(model => { if (!clean(model.productName)) model.productName = productMasterName(model); });
+        } finally { normalizeScope = null; }
         before.forEach((array, name) => { if (database[name] !== array) resyncIndex(name); });
       };
       const attachCollection = name => {
@@ -2555,7 +2577,12 @@
           try {
             result = await mutator(draft);
             draft.meta = { ...database.meta, updatedAt: nowISO(), revision: expectedRevision + 1 };
+            // Only saveSettings actually changes settings; every other write echoes the stored
+            // map back untouched so the rules' equality check passes for non-admin roles.
+            const settingsChanged = JSON.stringify(draft.settings) !== JSON.stringify(database.settings);
+            draft.__rootSettings = settingsChanged ? draft.settings : (storedSettings || draft.settings);
             await firestoreStorageAdapter.save(diffBaselines, expectedRevision, draft, writeScope);
+            if (settingsChanged) storedSettings = clone(draft.settings);
           } catch (error) {
             restoreScope(scope);
             if (error?.code !== "cloud-revision-conflict" || attempt === 2) throw error;
@@ -4046,7 +4073,7 @@
           restored.meta = { ...current.meta, updatedAt: nowISO(), revision:(Number(current.meta.revision)||0)+1 };
           await firestoreStorageAdapter.save(firestoreStorageAdapter.baselinesFrom(current,FIRESTORE_COLLECTIONS),Number(current.meta.revision)||0,restored,FIRESTORE_COLLECTIONS);
           FIRESTORE_COLLECTIONS.forEach(name => { if (!LOG_COLLECTIONS.includes(name)) database[name] = restored[name] || []; });
-          database.meta = restored.meta; database.settings = restored.settings;
+          database.meta = restored.meta; database.settings = restored.settings; storedSettings = clone(restored.settings);
           return true;
         },
         async clearAllData() {
@@ -4059,7 +4086,7 @@
           next.meta = { ...current.meta, updatedAt:nowISO(), revision:(Number(current.meta.revision)||0)+1 };
           await firestoreStorageAdapter.save(firestoreStorageAdapter.baselinesFrom(current,FIRESTORE_COLLECTIONS),Number(current.meta.revision)||0,next,FIRESTORE_COLLECTIONS);
           FIRESTORE_COLLECTIONS.forEach(name => { if (!LOG_COLLECTIONS.includes(name)) database[name] = next[name] || []; });
-          database.meta = next.meta; database.settings = next.settings;
+          database.meta = next.meta; database.settings = next.settings; storedSettings = clone(next.settings);
           return true;
         },
         // Listeners already stream every change; this just re-reads the root revision.
