@@ -1,7 +1,17 @@
 {
-  "//": "Composite indexes for the on-demand log queries. The app falls back to an unsorted page until these exist, so it works before they finish building. Deploy with: firebase deploy --only firestore:indexes",
+  "//": "Composite indexes for the on-demand queries. The app degrades gracefully until these exist (log views fall back to an unsorted page; stock counts fall back to 0), so it runs before they finish building. Deploy with: firebase deploy --only firestore:indexes",
   "indexes": [
     {
+      "//": "serialStockCount(modelId, stockStatus) - live availability without loading inventory",
+      "collectionGroup": "inventory",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "modelId", "order": "ASCENDING" },
+        { "fieldPath": "stockStatus", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "//": "product price history drawer",
       "collectionGroup": "priceLogs",
       "queryScope": "COLLECTION",
       "fields": [
@@ -10,6 +20,7 @@
       ]
     },
     {
+      "//": "quantity stock movement drawer",
       "collectionGroup": "stockMovements",
       "queryScope": "COLLECTION",
       "fields": [

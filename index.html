@@ -1448,7 +1448,7 @@
   } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-auth.js";
   import {
     getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-    doc, collection, getDoc, getDocs, query, where, orderBy, limit,
+    doc, collection, getDoc, getDocs, query, where, orderBy, limit, startAfter, getCountFromServer,
     writeBatch, runTransaction, onSnapshot
   } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
   (() => {
@@ -1498,12 +1498,13 @@
     // Everything else is Tier 1: attached lazily, the first time a route or mutation needs it.
     const ROUTE_COLLECTIONS = Object.freeze({
       dashboard: ["sales","returns","purchases","inventory","payments","notes","expenses"],
-      purchase: ["purchases","purchaseOrders","inventory"],
-      fulfillment: ["sales","saleOrders","inventory","payments","returns","notes","fieldOrders"],
+      // Day-to-day screens scan IMEIs by key, so they never attach the inventory collection.
+      purchase: ["purchases","purchaseOrders"],
+      fulfillment: ["sales","saleOrders","payments","returns","notes","fieldOrders"],
       stock: ["inventory"],
       inventory: ["inventory"],
       activation: ["inventory","activations","unmatchedActivations","sales"],
-      returns: ["returns","sales","purchases","inventory"],
+      returns: ["returns","sales","purchases"],
       expenses: ["expenses"],
       cndn: ["notes"],
       money: ["payments","collectionPlans"],
@@ -1512,9 +1513,9 @@
       reports: ["sales","purchases","returns","inventory","notes","payments","expenses","activations","unmatchedActivations"],
       pnl: ["sales","returns","expenses","notes"],
       masters: ["sales","purchases","returns","notes","payments"],
-      settings: ["inventory","purchases","sales","returns","payments"],
+      settings: ["purchases","sales","returns","payments"],
       users: [],
-      "order-management": ["fieldOrders","inventory"],
+      "order-management": ["fieldOrders"],
       "plan-received": ["collectionPlans","sales","returns","notes","payments"]
     });
     const REPORT_COLLECTIONS = ROUTE_COLLECTIONS.reports;
@@ -1522,18 +1523,20 @@
     // Collections each mutation reads or writes. commit() attaches exactly these, nothing more.
     const MUTATION_COLLECTIONS = Object.freeze({
       saveSettings: [], saveBrand: [], saveBulkBrands: [], saveExpenseHead: [], saveBulkExpenseHeads: [],
-      saveModel: ["inventory","purchases","sales"], saveBulkModels: ["inventory","purchases","sales"],
+      // `inventory` appears nowhere below: every mutation that touches it now names the exact
+      // IMEIs it needs, so the collection is never attached, scanned or diffed for a write.
+      saveModel: ["purchases","sales"], saveBulkModels: ["purchases","sales"],
       saveParty: [], saveBulkParties: [], saveUser: ["fieldOrders","collectionPlans"],
       savePurchaseOrder: ["purchaseOrders"], cancelPurchaseOrder: ["purchaseOrders"],
-      savePurchase: ["purchases","purchaseOrders","inventory"], saveBulkPurchases: ["purchases","inventory"],
-      importActivations: ["inventory","activations","unmatchedActivations"],
+      savePurchase: ["purchases","purchaseOrders"], saveBulkPurchases: ["purchases"],
+      importActivations: ["activations","unmatchedActivations"],
       saveSaleOrder: ["saleOrders"], cancelSaleOrder: ["saleOrders","fieldOrders"],
-      saveSale: ["sales","saleOrders","inventory","payments","returns","notes","fieldOrders"],
-      cancelSale: ["sales","saleOrders","inventory","payments","returns","fieldOrders"],
-      saveReturn: ["returns","sales","purchases","inventory"],
+      saveSale: ["sales","saleOrders","payments","returns","notes","fieldOrders"],
+      cancelSale: ["sales","saleOrders","payments","returns","fieldOrders"],
+      saveReturn: ["returns","sales","purchases"],
       saveQuantityReturn: ["returns","sales","purchases"],
       saveExpense: ["expenses"], saveNote: ["notes"],
-      saveFieldOrder: ["fieldOrders","inventory"], reviewFieldOrder: ["fieldOrders"],
+      saveFieldOrder: ["fieldOrders"], reviewFieldOrder: ["fieldOrders"],
       sendFieldOrderToBilling: ["fieldOrders","saleOrders"],
       saveCollectionPlan: ["collectionPlans"],
       savePlanReceipt: ["collectionPlans","payments"],
@@ -1885,6 +1888,37 @@
           const snapshot = await getDocs(build(false));
           return snapshot.docs.map(item => item.data());
         }
+      },
+      // Fetch specific records by their identity. Document ids are derived from the identity
+      // (IMEI for inventory), so this is a direct key lookup — no collection scan, and the
+      // persistent cache serves repeats for free.
+      async fetchRecords(name, identities) {
+        const wanted = [...new Set((identities || []).map(clean).filter(Boolean))];
+        const found = new Map();
+        const chunkSize = 40;
+        for (let index = 0; index < wanted.length; index += chunkSize) {
+          const chunk = wanted.slice(index, index + chunkSize);
+          const snapshots = await Promise.all(chunk.map(identity => getDoc(cloudRecordRef(name, identity))));
+          snapshots.forEach((snapshot, position) => { if (snapshot.exists()) found.set(chunk[position], snapshot.data()); });
+        }
+        return found;
+      },
+      // Server-side count. Billed per ~1000 matched index entries, so an aggregate over a huge
+      // collection costs about one read instead of downloading every document.
+      async countWhere(name, clauses) {
+        const snapshot = await getCountFromServer(query(companyCollection(name), ...clauses.map(([field, value]) => where(field, "==", value))));
+        return snapshot.data().count;
+      },
+      // One page of a collection, filtered and ordered on the server.
+      async queryPage(name, { filters = [], sortField = "", direction = "desc", take = 50, cursor = null, range = null } = {}) {
+        const clauses = [companyCollection(name)];
+        filters.forEach(([field, value]) => clauses.push(where(field, "==", value)));
+        if (range) { clauses.push(where(range.field, ">=", range.from)); clauses.push(where(range.field, "<=", range.to)); }
+        if (sortField) clauses.push(orderBy(sortField, direction));
+        if (cursor) clauses.push(startAfter(cursor));
+        clauses.push(limit(take));
+        const snapshot = await getDocs(query(...clauses));
+        return { rows: snapshot.docs.map(item => item.data()), cursor: snapshot.docs.at(-1) || null, complete: snapshot.docs.length < take };
       },
       watchRoot(callback) {
         return onSnapshot(companyRef, snapshot => callback(snapshot.exists() ? snapshot.data() : null),
@@ -2451,7 +2485,7 @@
       const scheduleLiveRefresh = () => {
         clearTimeout(liveRefreshTimer);
         liveRefreshTimer = setTimeout(async () => {
-          try { renormalize(); await onLiveChange?.(); } catch (error) { console.error("Unable to apply live update", error); }
+          try { renormalize(); clearStockCache(); await onLiveChange?.(); } catch (error) { console.error("Unable to apply live update", error); }
         }, 250);
       };
       const get = () => {
@@ -2472,10 +2506,13 @@
       // so a commit costs nothing up front no matter how large a collection is. Mutators
       // edit records in place; if the commit fails, restoreScope puts them back from the
       // serialised baseline, which is the exact pre-commit state of every record.
-      const draftScope = scope => {
+      const draftScope = (scope, keyed) => {
         const draft = { ...database, meta: clone(database.meta), settings: clone(database.settings) };
         scope.forEach(name => { draft[name] = (database[name] || []).slice(); });
         LOG_COLLECTIONS.forEach(name => { draft[name] = []; });
+        // Keyed collections are never scanned: the draft holds only the records this
+        // operation named, so the cost is O(records touched), not O(collection size).
+        keyed?.forEach((records, name) => { draft[name] = [...records.values()]; });
         return draft;
       };
       const restoreScope = scope => {
@@ -2488,16 +2525,37 @@
           database[name] = [...index.values()];
         });
       };
-      const runCommit = async (mutator, scope) => {
-        const writeScope = [...new Set([...scope, ...LOG_COLLECTIONS])];
+      // Load the named records straight from their document ids and build a diff baseline
+      // for just those. Nothing else in the collection is read, held or compared.
+      const loadKeyed = async request => {
+        if (!request) return null;
+        const keyed = new Map();
+        const keyedBaselines = new Map();
+        for (const [name, identities] of Object.entries(request)) {
+          const records = await firestoreStorageAdapter.fetchRecords(name, identities);
+          const baseline = new Map();
+          records.forEach((record, identity) => baseline.set(identity, JSON.stringify(record)));
+          keyed.set(name, records);
+          keyedBaselines.set(name, baseline);
+        }
+        return { keyed, keyedBaselines };
+      };
+      const runCommit = async (mutator, scope, keyedRequest) => {
+        const keyedNames = Object.keys(keyedRequest || {});
+        const writeScope = [...new Set([...scope, ...keyedNames, ...LOG_COLLECTIONS])];
         for (let attempt = 0; attempt < 3; attempt++) {
           const expectedRevision = Number(database.meta.revision) || 0;
-          const draft = draftScope(scope);
+          const loaded = await loadKeyed(keyedRequest);
+          const draft = draftScope(scope, loaded?.keyed);
+          // Keyed collections diff against their own small baseline, so records that were
+          // not requested are never seen and therefore never rewritten or deleted.
+          const diffBaselines = new Map(baselines);
+          loaded?.keyedBaselines.forEach((baseline, name) => diffBaselines.set(name, baseline));
           let result;
           try {
             result = await mutator(draft);
             draft.meta = { ...database.meta, updatedAt: nowISO(), revision: expectedRevision + 1 };
-            await firestoreStorageAdapter.save(baselines, expectedRevision, draft, writeScope);
+            await firestoreStorageAdapter.save(diffBaselines, expectedRevision, draft, writeScope);
           } catch (error) {
             restoreScope(scope);
             if (error?.code !== "cloud-revision-conflict" || attempt === 2) throw error;
@@ -2516,12 +2574,14 @@
       };
       // `operation` names the mutation so its collection scope is attached before the
       // draft is taken, and so only those collections are cloned and diffed.
-      const commit = (operation, mutator) => {
+      // `keyedRequest` names individual records to load by id (e.g. { inventory: [imei,…] }),
+      // so a mutation never needs its collection attached.
+      const commit = (operation, mutator, keyedRequest) => {
         const scope = [...new Set([...CORE_COLLECTIONS, ...(MUTATION_COLLECTIONS[operation] || [])])].filter(canReadCollection);
         const queued = commitQueue.then(async () => {
           await ensureCollections(scope);
-          if (navigator.locks?.request) return navigator.locks.request("infiniaa.firebase.write", () => runCommit(mutator, scope));
-          return runCommit(mutator, scope);
+          if (navigator.locks?.request) return navigator.locks.request("infiniaa.firebase.write", () => runCommit(mutator, scope, keyedRequest));
+          return runCommit(mutator, scope, keyedRequest);
         });
         commitQueue = queued.catch(() => undefined);
         return queued;
@@ -2728,7 +2788,15 @@
         }
         return record;
       };
-      const applyModel = (draft, values) => {
+      // Serial stock counts come from a server-side aggregate, never from a loaded collection.
+      const serialStockCount = async (modelId, stockStatus) => {
+        if (!clean(modelId)) return 0;
+        const clauses = [["modelId", modelId]];
+        if (stockStatus) clauses.push(["stockStatus", stockStatus]);
+        try { return await firestoreStorageAdapter.countWhere("inventory", clauses); }
+        catch (error) { console.error("Stock count failed", error); return 0; }
+      };
+      const applyModel = (draft, values, serialCount = 0) => {
         const name = clean(values.productName || values.name);
         if (!name || !values.brandId) throw new Error("Brand and product name are required");
         byId(draft.brands, values.brandId, "Brand");
@@ -2753,7 +2821,7 @@
           const oldValue = clone(record);
           const oldTrackingMode = trackingModeOf(record);
           if (oldTrackingMode !== payload.trackingMode) {
-            const hasTransactions = draft.inventory.some(row => row.modelId === record.id)
+            const hasTransactions = serialCount > 0
               || draft.quantityStock.some(row => row.modelId === record.id && (Number(row.quantity) || Number(row.damagedQty)))
               || draft.purchases.some(row => row.items?.some(line => line.modelId === record.id))
               || draft.sales.some(row => row.items?.some(line => line.modelId === record.id));
@@ -2874,6 +2942,14 @@
           listeners.clear(); loadedSet.clear(); pendingAttach.clear(); indexes.clear();
           database = null;
         },
+        // Direct key lookups so scanning screens never need the inventory collection loaded.
+        async lookupIMEIs(imeis) { return firestoreStorageAdapter.fetchRecords("inventory", imeis); },
+        async lookupIMEI(imei) { return (await firestoreStorageAdapter.fetchRecords("inventory", [imei])).get(clean(imei)) || null; },
+        async countSerialStock(modelId, stockStatus) { return serialStockCount(modelId, stockStatus); },
+        async countInventory() { return firestoreStorageAdapter.countWhere("inventory", []); },
+        // One server-side page of a collection: filtering, ordering and paging all happen
+        // in Firestore, so the browser only ever holds the rows it is showing.
+        async page(name, options) { return firestoreStorageAdapter.queryPage(name, options); },
         // Narrow, on-demand reads for the append-only logs that are never held in memory.
         async getAuditLogs(take = 100) { return firestoreStorageAdapter.queryLog("auditLogs", null, null, "timestamp", take); },
         async getPriceLogs(modelId, take = 100) { return firestoreStorageAdapter.queryLog("priceLogs", "modelId", modelId, "changedAt", take); },
@@ -2899,10 +2975,13 @@
           return commit("saveBulkBrands", draft => records.map(values => applyBrand(draft, values)));
         },
         async saveModel(values) {
-          return commit("saveModel", draft => applyModel(draft, values));
+          const serialCount = await serialStockCount(clean(values.id) ? clean(values.id) : "");
+          return commit("saveModel", draft => applyModel(draft, values, serialCount));
         },
         async saveBulkModels(records) {
-          return commit("saveBulkModels", draft => records.map(values => applyModel(draft, values)));
+          const counts = new Map();
+          for (const values of records) { const id = clean(values.id); if (id && !counts.has(id)) counts.set(id, await serialStockCount(id)); }
+          return commit("saveBulkModels", draft => records.map(values => applyModel(draft, values, counts.get(clean(values.id)) || 0)));
         },
         async saveParty(values) {
           return commit("saveParty", draft => applyParty(draft, values));
@@ -2996,6 +3075,7 @@
           });
         },
         async savePurchase(input) {
+          const touchedIMEIs = [...(input.items || []), ...(input.quantityItems || [])].map(item => clean(item?.imei)).filter(Boolean);
           return commit("savePurchase", draft => {
             const supplier = byId(draft.parties, input.supplierId, "Supplier");
             if (!partyCanSupply(supplier)) throw new Error("Selected party cannot be used as a supplier");
@@ -3131,9 +3211,10 @@
             audit(draft, "Purchase Created", "PURCHASE", id, null, { invoiceNumber, totalQty: items.length, totalValue: record.totalValue });
             audit(draft, "IMEI Status Changed", "INVENTORY_BATCH", id, null, { imeis: items.map(row=>row.imei), stockStatus: STATUS.IN_STOCK });
             return record;
-          });
+          }, { inventory: touchedIMEIs });
         },
         async saveBulkPurchases(rows) {
+          const touchedIMEIs = (rows || []).map(row => clean(row?.imei)).filter(Boolean);
           return commit("saveBulkPurchases", draft => {
             if (!Array.isArray(rows) || !rows.length) throw new Error("No valid rows to import");
             ensureUniqueIMEIs(rows);
@@ -3184,9 +3265,10 @@
               audit(draft, "Purchase Created", "PURCHASE", id, null, { source: "CSV", invoiceNumber: record.invoiceNumber, totalQty: record.totalQty });
             });
             return { purchases: created.length, rows: rows.length };
-          });
+          }, { inventory: touchedIMEIs });
         },
         async importActivations(records, sourceFile) {
+          const touchedIMEIs = (records || []).map(row => normalizeIMEI(row?.imei)).filter(Boolean);
           return commit("importActivations", draft => {
             if (!Array.isArray(records) || !records.length) throw new Error("No activation records to import");
             const inventoryMap = new Map(draft.inventory.map(row => [row.imei, row]));
@@ -3234,7 +3316,7 @@
             });
             audit(draft, "Activation Imported", "ACTIVATION", importedSource, null, summary);
             return summary;
-          });
+          }, { inventory: touchedIMEIs });
         },
         async saveSaleOrder(input) {
           return commit("saveSaleOrder", draft => {
@@ -3290,6 +3372,7 @@
           });
         },
         async saveSale(input) {
+          const touchedIMEIs = (input.items || []).filter(item => item?.trackingMode !== TRACKING_MODE.QUANTITY).map(item => clean(item?.imei)).filter(Boolean);
           return commit("saveSale", draft => {
             const billingMode = operatingModeOf(draft.settings);
             const tallyParallel = billingMode === OPERATING_MODE.TALLY_PARALLEL;
@@ -3483,9 +3566,12 @@
             audit(draft, customerType === CUSTOMER_TYPE.CASH ? "Direct Cash Sale Created" : specialPriceSale ? "Special Price Sale Created" : tallyParallel ? "Tally Parallel Sale Created" : "Sale Created", "SALE", id, null, { invoiceNumber, billingMode, customerType, saleType, priceOverrideReason: record.priceOverrideReason, customerName: customer.name, customerMobile: customer.mobile, totalQty: record.totalQty, grandTotal: record.grandTotal, overrides: lines.filter(row => row.priceOverridden).map(row => ({ item: row.imei || row.modelName, masterRate: row.masterRate, saleRate: row.rate })) });
             if (imeis.length) audit(draft, "IMEI Status Changed", "INVENTORY_BATCH", id, null, { imeis, stockStatus: STATUS.SOLD });
             return { sale: record, collection: collectionRecord };
-          });
+          }, { inventory: touchedIMEIs });
         },
         async cancelSale(id) {
+          await ensureCollections(["sales"].filter(canReadCollection));
+          const cancelling = get().sales.find(row => row.id === id);
+          const touchedIMEIs = (cancelling?.items || []).filter(line => line.trackingMode !== TRACKING_MODE.QUANTITY).map(line => clean(line.imei)).filter(Boolean);
           return commit("cancelSale", draft => {
             const sale = byId(draft.sales, id, "Sale");
             if (sale.status === "CANCELLED") throw new Error("Sale is already cancelled");
@@ -3556,9 +3642,10 @@
               }
             }
             return { sale, reopenedOrder, voidedCollections };
-          });
+          }, { inventory: touchedIMEIs });
         },
         async saveReturn(input) {
+          const touchedIMEIs = [clean(input.imei)].filter(Boolean);
           return commit("saveReturn", draft => {
             const imei = clean(input.imei);
             if (!isValidIMEI(imei)) throw new Error("Enter a valid Serial / IMEI (6–40 supported characters)");
@@ -3615,7 +3702,7 @@
             audit(draft, type === "SALES_RETURN" ? "Sales Return" : "Purchase Return", "RETURN", id, null, { imei, outcome, originalInvoice });
             audit(draft, "IMEI Status Changed", "INVENTORY", imei, null, { stockStatus: inventory.stockStatus });
             return record;
-          });
+          }, { inventory: touchedIMEIs });
         },
         async saveQuantityReturn(input) {
           return commit("saveQuantityReturn", draft => {
@@ -3736,6 +3823,16 @@
           });
         },
         async saveFieldOrder(input) {
+          // Availability is recorded on the order for reference; count it on the server.
+          const availability = new Map();
+          for (const item of (input.items || [])) {
+            const modelId = clean(item?.modelId);
+            if (!modelId || availability.has(modelId)) continue;
+            const model = get().models.find(row => row.id === modelId);
+            availability.set(modelId, isQuantityTracked(model)
+              ? Number(get().quantityStock.find(row => row.modelId === modelId)?.quantity || 0)
+              : await serialStockCount(modelId, STATUS.IN_STOCK));
+          }
           return commit("saveFieldOrder", draft=>{
             if(currentRole!==ROLES.SALESMAN)throw new Error("Only a Salesman login can submit a field order");
             const salesman=byId(draft.users,currentUserId,"Salesman");
@@ -3748,7 +3845,7 @@
             const seen=new Set(),items=input.items.map(item=>{
               const {model,brand,productName}=productSnapshot(draft,item.modelId);if(seen.has(model.id))throw new Error(productName+" is already added");seen.add(model.id);
               const quantity=Number(item.quantity),rate=Number(model.saleRate),gst=Number(model.gst||0);if(!Number.isInteger(quantity)||quantity<=0)throw new Error("Enter a valid quantity for "+productName);if(!Number.isFinite(rate)||rate<=0)throw new Error("Product Master sale price is missing for "+productName);
-              const available=isQuantityTracked(model)?Number(draft.quantityStock.find(stock=>stock.modelId===model.id)?.quantity||0):draft.inventory.filter(stock=>stock.modelId===model.id&&stock.stockStatus===STATUS.IN_STOCK).length;
+              const available=Number(availability.get(model.id)||0);
               return {modelId:model.id,brandId:brand.id,brandName:brand.name,productName,trackingMode:trackingModeOf(model),quantity,rate,gst,availableAtOrder:available,lineValue:quantity*rate*(1+gst/100)};
             });
             const taxableValue=sum(items,line=>line.quantity*line.rate),gstAmount=sum(items,line=>line.quantity*line.rate*line.gst/100),id=uid("FOD"),orderNumber=nextDocumentNo(draft.fieldOrders,"FO","orderNumber");
@@ -3838,10 +3935,11 @@
           });
         },
         async getIMEIHistory(imei) {
-          await ensureCollections(["inventory","purchases","sales","returns","activations"].filter(canReadCollection));
-          const db = get();
-          const inventory = db.inventory.find(row => row.imei === clean(imei));
+          // The IMEI itself is a direct key lookup; only its related history is scanned.
+          const inventory = await this.lookupIMEI(imei);
           if (!inventory) return null;
+          await ensureCollections(["purchases","sales","returns","activations"].filter(canReadCollection));
+          const db = get();
           return clone({
             inventory,
             purchase: db.purchases.find(row => row.id === inventory.purchaseId) || null,
@@ -3853,10 +3951,14 @@
         async globalSearch(term) {
           const needle = lower(term);
           if (!needle) return [];
-          await ensureCollections(["inventory","sales","payments"].filter(canReadCollection));
+          await ensureCollections(["sales","payments"].filter(canReadCollection));
           const db = get();
           const results = [];
-          db.inventory.filter(row => [row.imei,row.customerName,row.customerMobile].some(value => lower(value).includes(needle))).slice(0, 6).forEach(row => results.push({ type: "IMEI", id: row.imei, title: row.imei, subtitle: [statusLabel(row.stockStatus),row.customerName,row.customerMobile].filter(Boolean).join(" · ") }));
+          // An exact IMEI is a key lookup. Scanning the collection only happens if some other
+          // screen already had it loaded, so searching never forces the download.
+          const exact = isValidIMEI(normalizeIMEI(term)) ? await this.lookupIMEI(normalizeIMEI(term)) : null;
+          if (exact) results.push({ type: "IMEI", id: exact.imei, title: exact.imei, subtitle: [statusLabel(exact.stockStatus), exact.customerName, exact.customerMobile].filter(Boolean).join(" · ") });
+          (loadedSet.has("inventory") ? db.inventory : []).filter(row => row.imei !== exact?.imei).filter(row => [row.imei,row.customerName,row.customerMobile].some(value => lower(value).includes(needle))).slice(0, 6).forEach(row => results.push({ type: "IMEI", id: row.imei, title: row.imei, subtitle: [statusLabel(row.stockStatus),row.customerName,row.customerMobile].filter(Boolean).join(" · ") }));
           db.sales.filter(row => [row.invoiceNumber,row.customerName,row.customerMobile,row.customerSnapshot?.address,row.customerSnapshot?.area].some(value => lower(value).includes(needle))).slice(0, 5).forEach(row => results.push({ type: "INVOICE", id: row.id, title: row.invoiceNumber, subtitle: [customerTypeLabel(row),row.customerName,row.customerMobile].filter(Boolean).join(" · ") }));
           db.payments.filter(row => [row.voucherNumber,row.partyName,row.reference].some(value => lower(value).includes(needle))).slice(0, 4).forEach(row => results.push({ type: "VOUCHER", id: row.id, title: row.voucherNumber, subtitle: [moneyTypeLabel(row.type),row.partyName,money(row.amount),statusLabel(row.status)].join(" · ") }));
           db.parties.filter(row => [row.name,row.code,row.mobile,row.gstin].some(value => lower(value).includes(needle))).slice(0, 5).forEach(row => results.push({ type: "PARTY", id: row.id, title: row.name, subtitle: row.code + " · " + row.mobile }));
@@ -4050,12 +4152,23 @@
       const salesmanIds=visibleSalesmanIds(db);
       return db.parties.filter(party=>party.status==="ACTIVE"&&["CUSTOMER","BOTH"].includes(party.type)&&salesmanIds.has(party.salesmanUserId));
     };
+    // Serial availability comes from a server-side count, cached per render pass and cleared
+    // whenever a write lands, so a screen showing 40 products costs 40 aggregate reads once
+    // instead of holding every IMEI in memory.
+    const serialStockCache = new Map();
+    const clearStockCache = () => serialStockCache.clear();
+    const primeSerialStock = async models => {
+      const wanted = [...new Set(models.filter(model => model && !isQuantityTracked(model)).map(model => model.id))]
+        .filter(id => !serialStockCache.has(id));
+      const counts = await Promise.all(wanted.map(id => dataService.countSerialStock(id, STATUS.IN_STOCK)));
+      wanted.forEach((id, index) => serialStockCache.set(id, counts[index]));
+    };
     const availableStockForModel=(db,modelOrId)=>{
       const model=typeof modelOrId==="string"?db.models.find(row=>row.id===modelOrId):modelOrId;
       if(!model)return 0;
       return isQuantityTracked(model)
         ? Number(db.quantityStock.find(row=>row.modelId===model.id)?.quantity||0)
-        : db.inventory.filter(row=>row.modelId===model.id&&row.stockStatus===STATUS.IN_STOCK).length;
+        : Number(serialStockCache.get(model.id)||0);
     };
     const workflowStatusClass=status=>["APPROVED","BILLED","RECEIVED"].includes(status)?"is-good":["REJECTED","CANCELLED"].includes(status)?"is-bad":"is-open";
     const workflowStatus=status=>`<span class="workflow-status ${workflowStatusClass(status)}">${esc(statusLabel(status))}</span>`;
@@ -4269,6 +4382,7 @@
     const execute = async (work, successMessage, after) => {
       try {
         const result = await work();
+        clearStockCache(); // any write can move stock, so counted figures are refetched
         if (successMessage) toast(successMessage);
         if (after) await after(result);
         return result;
@@ -4278,11 +4392,12 @@
         return null;
       }
     };
+    // Master data only. An inventory map used to be built here on every single render and was
+    // never read — at scale that alone was a per-render pass over the whole IMEI collection.
     const getMaps = db => ({
       brands: new Map(db.brands.map(row => [row.id, row])),
       models: new Map(db.models.map(row => [row.id, row])),
-      parties: new Map(db.parties.map(row => [row.id, row])),
-      inventory: new Map(db.inventory.map(row => [row.imei, row]))
+      parties: new Map(db.parties.map(row => [row.id, row]))
     });
     const productName = (inventory, maps) => {
       const brand = maps.brands.get(inventory.brandId)?.name || inventory.brandName || "Unknown";
@@ -5504,6 +5619,8 @@
       const needle=lower(state.fieldOrderSearch);if(needle)rows=rows.filter(order=>[order.orderNumber,order.partyName,order.partyCode,order.salesmanName,order.salesHeadName,order.status,...order.items.flatMap(line=>[line.brandName,line.productName])].some(value=>lower(value).includes(needle)));
       rows.sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)));
       const draft=state.fieldOrderDraft,parties=visibleCustomerParties(db),brands=db.brands.filter(brand=>brand.status==="ACTIVE"),models=db.models.filter(model=>model.status==="ACTIVE"&&model.brandId===draft.brandId),maps=getMaps(db);
+      // Count stock only for the products this screen is about to show.
+      await primeSerialStock([...models, ...draft.items.map(item=>maps.models.get(item.modelId))]);
       const selectedModel=maps.models.get(draft.modelId),selectedStock=availableStockForModel(db,selectedModel),requestedQty=Number(draft.quantity||0),itemTotal=sum(draft.items,item=>Number(item.quantity)*Number(maps.models.get(item.modelId)?.saleRate||0)*(1+Number(maps.models.get(item.modelId)?.gst||0)/100));
       const salesmanOptions=db.users.filter(user=>user.role===ROLES.SALESMAN&&scope.has(user.id));
       const form=isSalesman?`<section class="card mobile-workspace" style="margin-bottom:16px">
@@ -5555,7 +5672,10 @@
     // Settings and cloud backup
     const renderSettings = async db => {
       // Audit rows live only in the cloud; the last 100 are fetched just for this screen.
-      const auditLogs = await dataService.getAuditLogs(100).catch(error => { console.error("Unable to read audit log", error); return []; });
+      const [auditLogs, imeiCount] = await Promise.all([
+        dataService.getAuditLogs(100).catch(error => { console.error("Unable to read audit log", error); return []; }),
+        dataService.countInventory().catch(() => 0)
+      ]);
       return `<div class="page">${pageHeader("Settings","Company details, data backup and access controls.")}
       <div class="grid grid-2">
         <section class="card"><div class="card-head"><h3>Company & invoice</h3></div><div class="card-body"><form id="settings-form">
@@ -5582,7 +5702,7 @@
         </form></div></section>
         <div class="grid">
           <section class="card"><div class="card-head"><h3>Data Backup</h3><span class="badge badge-success">Ready</span></div><div class="card-body"><p style="color:var(--muted);margin-top:0">Export a complete JSON backup${isAdminRole()?", or restore business data from a valid backup file. User accounts are preserved.":"."}</p><div class="inline-actions"><button class="btn" data-action="export-backup">${icon("download")}Export Backup</button>${isAdminRole()?`<button class="btn" data-action="choose-backup">${icon("upload")}Import Backup</button>`:""}<button class="btn" data-action="refresh-cloud">Refresh Data</button></div></div></section>
-          <section class="card"><div class="card-head"><h3>Data Summary</h3></div><div class="card-body"><div class="stats-strip" style="margin:0">${[["Version",db.meta.schemaVersion],["Updates",db.meta.revision||0],["IMEIs",db.inventory.length],["Quantity Units",sum(db.quantityStock,row=>Number(row.quantity)+Number(row.damagedQty))],["Purchases",db.purchases.length],["Sales",db.sales.length],["Returns",db.returns.length],["Money Vouchers",db.payments.length]].map(([label,value])=>`<div class="mini-stat"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div></div></section>
+          <section class="card"><div class="card-head"><h3>Data Summary</h3></div><div class="card-body"><div class="stats-strip" style="margin:0">${[["Version",db.meta.schemaVersion],["Updates",db.meta.revision||0],["IMEIs",imeiCount],["Quantity Units",sum(db.quantityStock,row=>Number(row.quantity)+Number(row.damagedQty))],["Purchases",db.purchases.length],["Sales",db.sales.length],["Returns",db.returns.length],["Money Vouchers",db.payments.length]].map(([label,value])=>`<div class="mini-stat"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div></div></section>
           ${isAdminRole()?`<section class="card danger-zone"><div class="card-head"><h3>Data Controls</h3></div><div class="card-body"><p style="color:var(--muted);margin-top:0">Clear removes all masters and operational records while preserving company settings and user profiles.</p><div class="inline-actions"><button class="btn btn-danger-soft" data-action="clear-data">Clear Business Data</button></div></div></section>`:""}
         </div>
         <section class="card span-2"><div class="card-head"><h3>Recent audit log</h3><span class="badge">Last 100 actions</span></div>
@@ -5681,7 +5801,7 @@
       const setup=state.purchaseImportSetup,db=await dataService.getDatabase(),supplier=db.parties.find(row=>row.id===setup.supplierId&&row.status==="ACTIVE"&&["SUPPLIER","BOTH"].includes(row.type));
       if(!supplier)throw new Error("Search and select an active supplier first");
       if(!clean(setup.invoiceNumber)||!isValidDateISO(setup.invoiceDate))throw new Error("Enter a valid invoice number and date first");
-      const existing=new Set(db.inventory.map(row=>row.imei)),seen=new Set();
+      const existing=new Set((await dataService.lookupIMEIs(parsed.rows.map(raw=>normalizeIMEI(pickHeader(raw,["Serial / IMEI","Serial","Serial Number","IMEI","IMEI Number"]))))).keys()),seen=new Set();
       const rows=parsed.rows.map(raw=>{
         const imei=normalizeIMEI(pickHeader(raw,["Serial / IMEI","Serial","Serial Number","IMEI","IMEI Number"]));
         const modelText=pickHeader(raw,["Product","Product Name","Model","Model Name"]);
@@ -5852,10 +5972,10 @@
     const addPurchaseOrderScans=async value=>{
       const draft=state.purchaseReceiveDraft,candidates=tokenIMEIs(value);
       if(!candidates.length)return;
-      const db=await dataService.getDatabase(["purchaseOrders","purchases","inventory"]),order=db.purchaseOrders.find(row=>row.id===draft.orderId&&row.status==="PENDING"),orderLine=order?.items.find(line=>line.modelId===draft.modelId),model=db.models.find(row=>row.id===draft.modelId);
+      const db=await dataService.getDatabase(["purchaseOrders","purchases"]),order=db.purchaseOrders.find(row=>row.id===draft.orderId&&row.status==="PENDING"),orderLine=order?.items.find(line=>line.modelId===draft.modelId),model=db.models.find(row=>row.id===draft.modelId);
       if(!order||!orderLine){toast("Select an ordered product first","warning");return;}
       if(isQuantityTracked(model)){toast("This product is quantity-tracked","info","Use Add Quantity instead of scanning");return;}
-      const capacity=purchaseOrderLineRemaining(orderLine)-purchaseReceiveModelQty(draft,draft.modelId),inventoryIMEIs=new Set(db.inventory.map(row=>row.imei)),currentIMEIs=new Set((draft.items||[]).map(row=>row.imei));
+      const capacity=purchaseOrderLineRemaining(orderLine)-purchaseReceiveModelQty(draft,draft.modelId),inventoryIMEIs=new Set((await dataService.lookupIMEIs(candidates)).keys()),currentIMEIs=new Set((draft.items||[]).map(row=>row.imei));
       if(capacity<=0){toast("Required quantity is already complete for this model","info");return;}
       let added=0,invalid=0,duplicate=0,existing=0,excess=0;
       candidates.forEach(imei=>{
@@ -5894,7 +6014,7 @@
       if(!draft.modelId){toast("Select a product first","warning");return;}
       const candidates=tokenIMEIs(value);
       if(!candidates.length)return;
-      const db=await dataService.getDatabase(),model=db.models.find(row=>row.id===draft.modelId),existing=new Set(db.inventory.map(row=>row.imei)),current=new Set(draft.items.map(row=>row.imei));
+      const db=await dataService.getDatabase(),model=db.models.find(row=>row.id===draft.modelId),existing=new Set((await dataService.lookupIMEIs(candidates)).keys()),current=new Set(draft.items.map(row=>row.imei));
       if(isQuantityTracked(model)){toast("This product is quantity-tracked","info","Enter Purchase Quantity instead of scanning");return;}
       const rate=Number(model?.purchaseRate),gst=Number(model?.gst||0);
       if(!model||!Number.isFinite(rate)||rate<=0){toast("Product Master price missing","warning","Back Office must set a valid purchase price first");return;}
@@ -5921,7 +6041,7 @@
       const draft=state.saleDraft,candidates=tokenIMEIs(value);
       if(!saleCustomerReady(draft)){toast(draft.customerType===CUSTOMER_TYPE.CASH?"Enter buyer name and a valid mobile number":"Select a customer first","warning");return;}
       if(!candidates.length){toast("Scan or enter at least one IMEI","warning");$("#sale-scanner")?.focus();return;}
-      const db=await dataService.getDatabase(),inventoryMap=new Map(db.inventory.map(row=>[row.imei,row]));
+      const db=await dataService.getDatabase(),inventoryMap=await dataService.lookupIMEIs(candidates);
       const order=draft.orderId?db.saleOrders.find(row=>row.id===draft.orderId&&row.status==="PENDING"):null;
       if(draft.orderId&&!order){toast("Pending order not found","error");return;}
       const orderItemMap=new Map(saleOrderLines(order).map(line=>[line.modelId,line]));
@@ -6844,7 +6964,7 @@
     });
     const lookupReturnIMEI=async imei=>{
       if(!isValidIMEI(imei)){toast("Enter a valid Serial / IMEI","error","Use 6–40 supported characters");return;}
-      const db=await dataService.getDatabase(["inventory","sales","purchases"]),inv=db.inventory.find(row=>row.imei===imei);
+      const db=await dataService.getDatabase(["sales","purchases"]),inv=await dataService.lookupIMEI(imei);
       if(!inv){toast("IMEI not found","error");return;}
       const maps=getMaps(db),isSales=state.returnsTab==="sales";
       let source,value;
