@@ -2070,6 +2070,9 @@
         address: "",
         phone: "",
         invoicePrefix: "INV",
+        customerCodePrefix: "CUS",
+        supplierCodePrefix: "SUP",
+        dualCodePrefix: "PTY",
         operatingMode: OPERATING_MODE.FULL_BILLING,
         salePrintTemplate: PRINT_TEMPLATE.AUTO,
         darkMode: false,
@@ -3063,6 +3066,17 @@
               nextValues.operatingMode = operatingModeOf(nextValues);
             }
             if (nextValues.salePrintTemplate !== undefined && !isSupportedPrintTemplate(nextValues.salePrintTemplate)) throw new Error("Select a valid sale print template");
+            // Document prefixes end up inside generated codes, so keep them to safe characters.
+            [["invoicePrefix","Invoice"],["customerCodePrefix","Customer party code"],
+             ["supplierCodePrefix","Supplier party code"],["dualCodePrefix","Both party code"]].forEach(([key,label]) => {
+              if (nextValues[key] === undefined) return;
+              const value = clean(nextValues[key]).toUpperCase();
+              if (!CODE_PREFIX_PATTERN.test(value)) throw new Error(label + " prefix must be 1–10 letters, digits, - or _");
+              nextValues[key] = value;
+            });
+            const partyPrefixes = ["customerCodePrefix","supplierCodePrefix","dualCodePrefix"]
+              .map(key => nextValues[key] ?? draft.settings[key]);
+            if (new Set(partyPrefixes).size !== partyPrefixes.length) throw new Error("Customer, Supplier and Both party code prefixes must be different");
             const oldValue = clone(draft.settings);
             draft.settings = { ...draft.settings, ...nextValues };
             // Settings are not a record of their own — they live inside the company document,
@@ -5186,6 +5200,26 @@
       return `<section class="card"><div class="card-head"><div><h3>Pending quantity orders</h3><div class="cell-sub">Each order may contain multiple models. Complete every listed quantity in one sale.</div></div><span class="badge badge-warning">${rows.length} pending</span></div>
       ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Order</th><th>Party</th><th>Sale Type</th><th>Products &amp; Quantities</th><th>Total Qty</th>${isWarehouseRole()?"":"<th>Order Value</th>"}<th>Created</th><th>Action</th></tr></thead><tbody>${rows.map(row=>{const lines=saleOrderLines(row);return `<tr><td><div class="cell-main">${esc(row.orderNo)}</div><div class="cell-sub">${lines.length} product${lines.length===1?"":"s"}</div></td><td>${esc(row.partyName)}</td><td><span class="badge ${row.saleType!==SALE_TYPE.NORMAL?"badge-warning":""}">${esc(saleTypeLabel(row.saleType))}</span>${row.priceOverrideReason&&!isWarehouseRole()?`<div class="cell-sub">${esc(row.priceOverrideReason)}</div>`:""}</td><td>${lines.map(line=>{const model=maps.models.get(line.modelId),brand=maps.brands.get(line.brandId||model?.brandId);return `<div style="padding:4px 0"><div class="cell-main">${esc((brand?.name||"")+" · "+(line.productName||productMasterName(model)))}</div><div class="cell-sub"><span class="badge ${isQuantityTracked(model)?"badge-info":""}" style="margin-right:6px">${esc(trackingModeLabel(model))}</span>Qty <strong>${number(saleOrderLineRemaining(line))}</strong>${isWarehouseRole()?"":` · Agreed ${money(line.priceAtOrder?.saleRate||0)} + GST ${number(line.priceAtOrder?.gst||0)}%`}</div></div>`;}).join("")}</td><td><strong>${number(saleOrderRemainingQty(row))}</strong></td>${isWarehouseRole()?"":`<td class="money"><strong>${money(row.grandTotal)}</strong></td>`}<td>${dateFmt(row.orderDate)}</td><td><div class="inline-actions"><button class="btn btn-sm btn-primary" data-action="load-sale-order" data-id="${row.id}">Open &amp; Complete</button>${isWarehouseRole()?"":`<button class="btn btn-sm btn-danger-soft" data-action="cancel-sale-order" data-id="${row.id}">Cancel</button>`}</div></td></tr>`;}).join("")}</tbody></table></div>`:emptyState("No pending orders","Back Office can create one order with multiple products, quantities and agreed values.","check")}</section>`;
     };
+    // Party codes are suggested per type so customer and supplier series stay separate.
+    // The value is only a suggestion — the field stays editable for parties that already
+    // have a code of their own.
+    const CODE_PREFIX_PATTERN=/^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$/;
+    const codePrefixOf=(settings,key,fallback)=>{
+      const value=clean(settings?.[key]).toUpperCase();
+      return CODE_PREFIX_PATTERN.test(value)?value:fallback;
+    };
+    const partyCodePrefix=(settings,type)=>type==="SUPPLIER"?codePrefixOf(settings,"supplierCodePrefix","SUP")
+      :type==="BOTH"?codePrefixOf(settings,"dualCodePrefix","PTY")
+      :codePrefixOf(settings,"customerCodePrefix","CUS");
+    const nextPartyCode=(db,type)=>{
+      const prefix=partyCodePrefix(db.settings,type),taken=new Set((db.parties||[]).map(row=>lower(row.code)));
+      const series=(db.parties||[]).filter(row=>lower(row.code).startsWith(lower(prefix)+"-"));
+      let candidate=nextDocumentPreview(series,prefix,"code");
+      for(let guard=0;taken.has(lower(candidate))&&guard<9999;guard++){
+        candidate=prefix+"-"+String(Number(candidate.split("-").pop()||0)+1).padStart(4,"0");
+      }
+      return candidate;
+    };
     const nextDocumentPreview=(rows,prefix,field)=>{
       let maximum=0;
       rows.forEach(row=>{const match=clean(row[field]).match(/(\d+)$/);if(match)maximum=Math.max(maximum,Number(match[1]));});
@@ -5785,7 +5819,15 @@
           <div class="field"><label>Company Name</label><input class="input" name="companyName" value="${attr(db.settings.companyName)}"></div>
           <div class="grid grid-2"><div class="field"><label>GSTIN</label><input class="input" name="gstin" value="${attr(db.settings.gstin)}"></div><div class="field"><label>Phone</label><input class="input" name="phone" value="${attr(db.settings.phone)}"></div></div>
           <div class="field"><label>Address</label><textarea class="textarea" name="address">${esc(db.settings.address)}</textarea></div>
-          <div class="field"><label>Invoice Prefix</label><input class="input" name="invoicePrefix" value="${attr(db.settings.invoicePrefix)}"></div>
+          <div class="field"><label>Invoice Prefix</label><input class="input" name="invoicePrefix" value="${attr(db.settings.invoicePrefix)}" maxlength="10" style="text-transform:uppercase"></div>
+          <div class="field"><label>Party Code Prefixes</label>
+            <div class="grid grid-3">
+              <div class="field" style="margin:0"><label>Customer</label><input class="input" name="customerCodePrefix" value="${attr(partyCodePrefix(db.settings,"CUSTOMER"))}" maxlength="10" style="text-transform:uppercase" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,9}" title="Letters, digits, - or _ (max 10)"></div>
+              <div class="field" style="margin:0"><label>Supplier</label><input class="input" name="supplierCodePrefix" value="${attr(partyCodePrefix(db.settings,"SUPPLIER"))}" maxlength="10" style="text-transform:uppercase" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,9}" title="Letters, digits, - or _ (max 10)"></div>
+              <div class="field" style="margin:0"><label>Both</label><input class="input" name="dualCodePrefix" value="${attr(partyCodePrefix(db.settings,"BOTH"))}" maxlength="10" style="text-transform:uppercase" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,9}" title="Letters, digits, - or _ (max 10)"></div>
+            </div>
+            <div class="help">Used to suggest the next Party Code, e.g. <strong>${esc(partyCodePrefix(db.settings,"CUSTOMER"))}-0001</strong>. Existing party codes are never changed.</div>
+          </div>
           <div class="field"><label>Sales Operating Mode</label>
             <div class="mode-picker" role="radiogroup" aria-label="Sales operating mode">
               <label class="mode-choice"><input type="radio" name="operatingMode" value="FULL_BILLING" ${operatingModeOf(db.settings)===OPERATING_MODE.FULL_BILLING?"checked":""}><span class="mode-choice-body"><span class="mode-choice-mark" style="width:72px;font-size:8px;letter-spacing:.06em">INFINIAA</span><span class="mode-choice-copy"><strong>Full Billing</strong><span>Create, save and print the primary tax invoice in this app.</span></span></span></label>
@@ -6275,10 +6317,11 @@
     const showPartyEditor=async id=>{
       const db=await dataService.getDatabase(),row=db.parties.find(item=>item.id===id)||{};
       const salesmen=db.users.filter(user=>user.role===ROLES.SALESMAN&&(user.status==="ACTIVE"||user.id===row.salesmanUserId));
+      const suggestedCode=id?"":nextPartyCode(db,row.type||"CUSTOMER");
       showModal({title:id?"Edit Party":"Add Party",size:"modal-lg",body:`<form id="party-form"><input type="hidden" name="id" value="${attr(row.id||"")}"><div class="grid grid-3">
         <div class="field span-2"><label>Party Name <span class="required">*</span></label><input class="input" name="name" value="${attr(row.name||"")}" required></div>
         <div class="field"><label>Party Type <span class="required">*</span></label><select class="select" name="type"><option value="SUPPLIER" ${row.type==="SUPPLIER"?"selected":""}>Supplier</option><option value="CUSTOMER" ${row.type==="CUSTOMER"||!row.type?"selected":""}>Customer / Dealer</option><option value="BOTH" ${row.type==="BOTH"?"selected":""}>Both</option></select></div>
-        <div class="field"><label>Party Code <span class="required">*</span></label><input class="input" name="code" value="${attr(row.code||"")}" required></div><div class="field"><label>GSTIN</label><input class="input" name="gstin" value="${attr(row.gstin||"")}" maxlength="15" placeholder="07ABCDE1234F1Z5" style="text-transform:uppercase" pattern="^[0-9]{2}[A-Za-z]{5}[0-9]{4}[A-Za-z][1-9A-Za-z][Zz][0-9A-Za-z]$" title="15-character GSTIN, e.g. 07ABCDE1234F1Z5"></div><div class="field"><label>Mobile</label><input class="input" name="mobile" value="${attr(row.mobile||"")}"></div>
+        <div class="field"><label>Party Code <span class="required">*</span></label><input class="input" name="code" id="party-code" value="${attr(row.code||suggestedCode)}" ${id?"":`data-auto-code="1"`} required><div class="help">${id?"Changing this affects reports and exports.":"Auto-generated — replace it if this party already has its own code."}</div></div><div class="field"><label>GSTIN</label><input class="input" name="gstin" value="${attr(row.gstin||"")}" maxlength="15" placeholder="07ABCDE1234F1Z5" style="text-transform:uppercase" pattern="^[0-9]{2}[A-Za-z]{5}[0-9]{4}[A-Za-z][1-9A-Za-z][Zz][0-9A-Za-z]$" title="15-character GSTIN, e.g. 07ABCDE1234F1Z5"></div><div class="field"><label>Mobile</label><input class="input" name="mobile" value="${attr(row.mobile||"")}"></div>
         <div class="field"><label>Email</label><input class="input" type="email" name="email" value="${attr(row.email||"")}"></div><div class="field"><label>Area</label><input class="input" name="area" value="${attr(row.area||"")}"></div><div class="field"><label>Status</label><select class="select" name="status"><option value="ACTIVE" ${row.status!=="INACTIVE"?"selected":""}>Active</option><option value="INACTIVE" ${row.status==="INACTIVE"?"selected":""}>Inactive</option></select></div>
         <div class="field span-3"><label>Mapped Salesman</label><select class="select" name="salesmanUserId">${options(salesmen,row.salesmanUserId,user=>user.name+" · "+user.loginId+" · Head: "+(db.users.find(head=>head.id===user.reportsToUserId)?.name||"Not mapped"),"Not mapped")}</select><div class="help">Applies to Customer / Both parties. Field orders and collection plans follow Salesman → Sales Head mapping.</div></div>
         <div class="field span-3"><label>Address</label><textarea class="textarea" name="address">${esc(row.address||"")}</textarea></div>
@@ -6931,6 +6974,15 @@
       else if(target.id==="expense-to"){state.expenseTo=target.value;await renderRoute();}
       else if(target.id==="cndn-from"){state.cndnFrom=target.value;await renderRoute();}
       else if(target.id==="cndn-to"){state.cndnTo=target.value;await renderRoute();}
+      else if(target.matches('#party-form select[name="type"]')){
+        // Keep the suggested code in step with the party type, but never overwrite a code
+        // the user has typed themselves.
+        const codeInput=$("#party-code");
+        if(codeInput?.dataset.autoCode==="1"){
+          const db=await dataService.getDatabase();
+          codeInput.value=nextPartyCode(db,target.value);
+        }
+      }
       else if(target.id==="cndn-party"){
         state.cndnPartyId=target.value;
         const db=await dataService.getDatabase(LEDGER_COLLECTIONS),party=db.parties.find(row=>row.id===target.value);
@@ -7027,6 +7079,8 @@
         const stateKey=target.id==="user-search"?"userSearch":target.id==="field-order-search"?"fieldOrderSearch":"planSearch";state[stateKey]=target.value;
         clearTimeout(target._timer);target._timer=setTimeout(async()=>{await renderRoute();const input=$("#"+target.id);if(input){input.focus();input.setSelectionRange(input.value.length,input.value.length);}},200);
       }
+      // Once the code is typed by hand it stops tracking the party type.
+      else if(target.id==="party-code")delete target.dataset.autoCode;
       else if(target.id==="sales-history-search")filterSalesHistory(target.value);
     });
 
