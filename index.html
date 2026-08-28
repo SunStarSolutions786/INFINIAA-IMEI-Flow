@@ -89,15 +89,6 @@
     .auth-status.show { display:block; }
     .auth-status.error { border-color:color-mix(in srgb,var(--danger) 35%,var(--line)); background:var(--danger-soft); color:var(--danger); }
     .auth-status.success { border-color:color-mix(in srgb,var(--success) 35%,var(--line)); background:var(--success-soft); color:var(--success); }
-    .setup-details { border-top:1px solid var(--line); background:var(--surface-2); }
-    .setup-details > summary { cursor:pointer; list-style:none; padding:15px 24px; color:var(--accent); font-weight:800; }
-    .setup-details > summary::-webkit-details-marker { display:none; }
-    .setup-details > summary::after { content:"＋"; float:right; }
-    .setup-details[open] > summary::after { content:"−"; }
-    .setup-panel { padding:0 24px 22px; }
-    .setup-panel p { color:var(--muted); font-size:12px; }
-    .cloud-pill { display:flex; align-items:center; gap:8px; }
-    .cloud-pill .status-dot { background:#19a974; box-shadow:0 0 0 4px rgba(25,169,116,.12); }
     button, input, select, textarea { font: inherit; }
     button { color: inherit; }
     .profile { cursor: pointer; border: 1px solid transparent; border-radius: 12px; padding: 6px 8px; }
@@ -181,22 +172,6 @@
     .nav-link:hover { background: var(--surface-2); color: var(--text); }
     .nav-link.active { background: var(--accent-soft); color: var(--accent); }
     .nav-link .nav-icon { width: 19px; height: 19px; flex: 0 0 auto; }
-    .sidebar-foot {
-      margin-top: auto;
-      border-top: 1px solid var(--line);
-      padding: 14px 7px 2px;
-    }
-    .local-pill {
-      display: flex;
-      gap: 9px;
-      align-items: center;
-      border-radius: 11px;
-      padding: 10px;
-      background: var(--surface-2);
-      color: var(--muted);
-      font-size: 11px;
-    }
-    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 4px var(--success-soft); }
     .topbar {
       position: fixed;
       z-index: 30;
@@ -1354,17 +1329,6 @@
     .nav-link:hover .nav-icon { transform: translateY(-1px) scale(1.06); }
     .nav-link.active { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent); }
 
-    .status-dot { position: relative; }
-    .status-dot::after {
-      content: "";
-      position: absolute; inset: -4px;
-      border-radius: inherit;
-      border: 1px solid var(--success);
-      opacity: 0;
-      animation: statusBreathe 2.6s ease-out infinite;
-    }
-    @keyframes statusBreathe { 0% { opacity: .55; transform: scale(1); } 100% { opacity: 0; transform: scale(1.9); } }
-
     .empty-icon { animation: emptyFloat 3.2s ease-in-out infinite; }
     @keyframes emptyFloat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
 
@@ -1390,7 +1354,7 @@
       .is-ready .scanner-led, .is-ready .scan-input-shell:focus-within::after { animation: none; }
       html { scroll-behavior: auto; }
       .page { animation: none; }
-      .status-dot::after, .toast::after { animation: none; display: none; }
+      .toast::after { animation: none; display: none; }
       .empty-icon { animation: none; }
       .btn, .btn:active:not(:disabled), .icon-button:active:not(:disabled) { transition: none; transform: none; }
       .modal, .drawer, .modal-backdrop, .drawer-backdrop, .toast { animation: none; }
@@ -1420,18 +1384,6 @@
           </form>
           <div class="auth-status" id="auth-status" role="status" aria-live="polite"></div>
         </div>
-        <details class="setup-details" id="first-admin-setup">
-          <summary>First-time Admin setup</summary>
-          <div class="setup-panel">
-            <p>Use this once on an empty Firebase project. It creates the first Administrator and initializes a clean Firestore database—no demo data.</p>
-            <form id="bootstrap-admin-form">
-              <div class="field"><label>Admin Name <span class="required">*</span></label><input class="input" name="name" autocomplete="name" required></div>
-              <div class="field"><label>Admin Email <span class="required">*</span></label><input class="input" type="email" name="email" autocomplete="email" required></div>
-              <div class="grid grid-2"><div class="field"><label>Password <span class="required">*</span></label><input class="input" type="password" name="password" autocomplete="new-password" minlength="8" required></div><div class="field"><label>Confirm <span class="required">*</span></label><input class="input" type="password" name="confirmPassword" autocomplete="new-password" minlength="8" required></div></div>
-              <button class="btn btn-primary auth-submit" type="submit">Create First Admin</button>
-            </form>
-          </div>
-        </details>
       </section>
     </div>
   </div>
@@ -1461,9 +1413,6 @@
         <button class="nav-link" data-route="masters" data-admin-only><span class="nav-icon" data-icon="database"></span>Masters</button>
         <button class="nav-link" data-route="users"><span class="nav-icon" data-icon="parties"></span>User Management</button>
         <button class="nav-link" data-route="settings" data-admin-only><span class="nav-icon" data-icon="settings"></span>Settings</button>
-      </div>
-      <div class="sidebar-foot">
-        <div class="local-pill cloud-pill"><span class="status-dot"></span><div><strong>Firebase Cloud</strong><br>Live secured database</div></div>
       </div>
     </aside>
     <div class="mobile-overlay" id="mobile-overlay"></div>
@@ -2313,7 +2262,7 @@
       let liveRefreshTimer = null;
 
       const hydrateDatabase = loaded => {
-        if (!loaded) throw new Error("Cloud workspace is not initialized. Sign out and use First-time Admin setup.");
+        if (!loaded) throw new Error("Cloud workspace is not initialized. Contact the Administrator.");
         if (loaded.meta?.schemaVersion !== SCHEMA_VERSION) throw new Error("This cloud database uses an unsupported schema version.");
         const base = createEmptyDatabase();
         FIRESTORE_COLLECTIONS.forEach(name => { base[name] = Array.isArray(loaded[name]) ? loaded[name] : []; });
@@ -6687,7 +6636,7 @@
     window.addEventListener("hashchange",()=>{if(!$("#app-shell").hidden)renderRoute();});
 
     // Firebase Authentication and app initialization
-    let bootstrapInProgress=false,startupPromise=null,startupUid="",pendingAuthMessage=null,profileUnsubscribe=null;
+    let startupPromise=null,startupUid="",pendingAuthMessage=null,profileUnsubscribe=null;
     const friendlyFirebaseError=error=>({
       "auth/invalid-credential":"Email or password is incorrect.",
       "auth/user-not-found":"No Firebase user exists for this email.",
@@ -6771,34 +6720,9 @@
       catch(error){setAuthMessage(friendlyFirebaseError(error),"error");}
       finally{setFormBusy(form,false);}
     });
-    $("#bootstrap-admin-form").addEventListener("submit",async event=>{
-      event.preventDefault();const form=event.currentTarget,values=formObject(form),email=lower(values.email),password=clean(values.password);
-      if(password!==values.confirmPassword){setAuthMessage("Passwords do not match.","error");return;}
-      if(password.length<8){setAuthMessage("Password must be at least 8 characters.","error");return;}
-      bootstrapInProgress=true;setFormBusy(form,true);setAuthMessage("Creating the first Firebase Admin…");
-      let credential=null;
-      try{
-        await authPersistenceReady;
-        credential=await createUserWithEmailAndPassword(firebaseAuth,email,password);
-        const adminProfile={id:credential.user.uid,name:clean(values.name),loginId:email,email,mobile:"",role:ROLES.ADMIN,reportsToUserId:"",status:"ACTIVE",createdAt:nowISO(),createdBy:"First-time setup",createdByUid:credential.user.uid};
-        const cleanDatabase=createEmptyDatabase();
-        cleanDatabase.meta={...cleanDatabase.meta,initializedBy:credential.user.uid};
-        const batch=writeBatch(firestore);
-        batch.set(companyRef,{meta:cleanDatabase.meta,settings:cleanDatabase.settings});
-        batch.set(doc(companyCollection("users"),credential.user.uid),adminProfile);
-        await batch.commit();
-        $("#first-admin-setup").open=false;setAuthMessage("Clean cloud workspace created.","success");
-        await startAuthenticatedApp(credential.user);
-      }catch(error){
-        if(credential?.user)await deleteUser(credential.user).catch(cleanupError=>console.error("Unable to roll back first Admin",cleanupError));
-        await signOut(firebaseAuth).catch(()=>undefined);
-        showSignedOut(friendlyFirebaseError(error),"error");
-      }finally{bootstrapInProgress=false;setFormBusy(form,false);}
-    });
     hydrateIcons();
     applyTheme(window.localStorage.getItem(THEME_KEY)==="dark");
     authPersistenceReady.then(()=>onAuthStateChanged(firebaseAuth,async user=>{
-      if(bootstrapInProgress)return;
       if(!user){const notice=pendingAuthMessage;pendingAuthMessage=null;showSignedOut(notice?.message||"",notice?.type||"");return;}
       setAuthMessage("Loading your cloud workspace…");
       try{await startAuthenticatedApp(user);}
