@@ -3065,7 +3065,9 @@
             if (nextValues.salePrintTemplate !== undefined && !isSupportedPrintTemplate(nextValues.salePrintTemplate)) throw new Error("Select a valid sale print template");
             const oldValue = clone(draft.settings);
             draft.settings = { ...draft.settings, ...nextValues };
-            audit(draft, "Settings Updated", "SETTINGS", "LOCAL", oldValue, draft.settings);
+            // Settings are not a record of their own — they live inside the company document,
+            // so the audit row points at that document instead of the old local-storage label.
+            audit(draft, "Settings Updated", "SETTINGS", COMPANY_ID, oldValue, draft.settings);
             return draft.settings;
           });
         },
