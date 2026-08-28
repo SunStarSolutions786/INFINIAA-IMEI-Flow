@@ -1447,7 +1447,8 @@
     createUserWithEmailAndPassword, deleteUser, sendPasswordResetEmail
   } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-auth.js";
   import {
-    getFirestore, doc, collection, getDoc, getDocs,
+    getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+    doc, collection, getDoc, getDocs, query, where, orderBy, limit,
     writeBatch, runTransaction, onSnapshot
   } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
   (() => {
@@ -1464,7 +1465,18 @@
     };
     const firebaseApp = initializeApp(firebaseConfig);
     const firebaseAuth = getAuth(firebaseApp);
-    const firestore = getFirestore(firebaseApp);
+    // Persistent IndexedDB cache: documents are billed once, then served locally.
+    // Listeners resume from the cached state across reloads, so only real changes cost a read.
+    const firestore = (() => {
+      try {
+        return initializeFirestore(firebaseApp, {
+          localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+        });
+      } catch (error) {
+        console.warn("Persistent cache unavailable, falling back to memory cache", error);
+        return getFirestore(firebaseApp);
+      }
+    })();
     const authPersistenceReady = setPersistence(firebaseAuth, browserLocalPersistence);
     const COMPANY_ID = "infiniaa";
     const SCHEMA_VERSION = 2;
@@ -1478,6 +1490,55 @@
       "brands","models","parties","users","fieldOrders","purchaseOrders","purchases","inventory","quantityStock",
       "stockMovements","saleOrders","sales","returns","payments"
     ]);
+    // Tier 0: small master data, needed by almost every screen — attached once at sign-in.
+    const CORE_COLLECTIONS = Object.freeze(["users","brands","models","parties","expenseHeads","quantityStock"]);
+    // Tier 2: append-only logs that grow without limit. Never held in the working set;
+    // read with a narrow query only when a drawer or report actually shows them.
+    const LOG_COLLECTIONS = Object.freeze(["auditLogs","priceLogs","stockMovements"]);
+    // Everything else is Tier 1: attached lazily, the first time a route or mutation needs it.
+    const ROUTE_COLLECTIONS = Object.freeze({
+      dashboard: ["sales","returns","purchases","inventory","payments","notes","expenses"],
+      purchase: ["purchases","purchaseOrders","inventory"],
+      fulfillment: ["sales","saleOrders","inventory","payments","returns","notes","fieldOrders"],
+      stock: ["inventory"],
+      inventory: ["inventory"],
+      activation: ["inventory","activations","unmatchedActivations","sales"],
+      returns: ["returns","sales","purchases","inventory"],
+      expenses: ["expenses"],
+      cndn: ["notes"],
+      money: ["payments","collectionPlans"],
+      outstanding: ["sales","purchases","returns","notes","payments"],
+      ledger: ["sales","purchases","returns","notes","payments"],
+      reports: ["sales","purchases","returns","inventory","notes","payments","expenses","activations","unmatchedActivations"],
+      pnl: ["sales","returns","expenses","notes"],
+      masters: ["sales","purchases","returns","notes","payments"],
+      settings: ["inventory","purchases","sales","returns","payments"],
+      users: [],
+      "order-management": ["fieldOrders","inventory"],
+      "plan-received": ["collectionPlans","sales","returns","notes","payments"]
+    });
+    const REPORT_COLLECTIONS = ROUTE_COLLECTIONS.reports;
+    const LEDGER_COLLECTIONS = ROUTE_COLLECTIONS.ledger;
+    // Collections each mutation reads or writes. commit() attaches exactly these, nothing more.
+    const MUTATION_COLLECTIONS = Object.freeze({
+      saveSettings: [], saveBrand: [], saveBulkBrands: [], saveExpenseHead: [], saveBulkExpenseHeads: [],
+      saveModel: ["inventory","purchases","sales"], saveBulkModels: ["inventory","purchases","sales"],
+      saveParty: [], saveBulkParties: [], saveUser: ["fieldOrders","collectionPlans"],
+      savePurchaseOrder: ["purchaseOrders"], cancelPurchaseOrder: ["purchaseOrders"],
+      savePurchase: ["purchases","purchaseOrders","inventory"], saveBulkPurchases: ["purchases","inventory"],
+      importActivations: ["inventory","activations","unmatchedActivations"],
+      saveSaleOrder: ["saleOrders"], cancelSaleOrder: ["saleOrders","fieldOrders"],
+      saveSale: ["sales","saleOrders","inventory","payments","returns","notes","fieldOrders"],
+      cancelSale: ["sales","saleOrders","inventory","payments","returns","fieldOrders"],
+      saveReturn: ["returns","sales","purchases","inventory"],
+      saveQuantityReturn: ["returns","sales","purchases"],
+      saveExpense: ["expenses"], saveNote: ["notes"],
+      saveFieldOrder: ["fieldOrders","inventory"], reviewFieldOrder: ["fieldOrders"],
+      sendFieldOrderToBilling: ["fieldOrders","saleOrders"],
+      saveCollectionPlan: ["collectionPlans"],
+      savePlanReceipt: ["collectionPlans","payments"],
+      saveMoneyTransaction: ["payments"], voidMoneyTransaction: ["payments","collectionPlans"]
+    });
     const FIELD_COLLECTIONS = Object.freeze([
       "brands","models","parties","users","fieldOrders","collectionPlans","inventory","quantityStock",
       "sales","returns","payments","notes"
@@ -1753,7 +1814,8 @@
       return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
     };
     const recordIdentity = (name, record) => clean(name === "inventory" ? record?.imei : record?.id);
-    const cloudRecordRef = (name, identity) => doc(companyCollection(name), name === "users" ? identity : toDocumentId(identity));
+    const documentIdFor = (name, identity) => name === "users" ? identity : toDocumentId(identity);
+    const cloudRecordRef = (name, identity) => doc(companyCollection(name), documentIdFor(name, identity));
     const recordMap = (name, rows) => {
       const result = new Map();
       (rows || []).forEach(record => {
@@ -1764,12 +1826,6 @@
       });
       return result;
     };
-    const stableValue = value => {
-      if (Array.isArray(value)) return value.map(stableValue);
-      if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map(key => [key, stableValue(value[key])]));
-      return value;
-    };
-    const sameRecord = (left, right) => JSON.stringify(stableValue(left)) === JSON.stringify(stableValue(right));
     const provisionFirebaseUser = async (email, password) => {
       const appName = "user-provision-" + Date.now() + "-" + Math.random().toString(36).slice(2);
       const secondaryApp = initializeApp(firebaseConfig, appName);
@@ -1791,37 +1847,80 @@
         throw error;
       }
     };
+    // Which collections this role is allowed to read at all (must mirror the Firestore rules).
+    const readableCollections = () => isFieldRole() ? FIELD_COLLECTIONS : isWarehouseRole() ? WAREHOUSE_COLLECTIONS : FIRESTORE_COLLECTIONS;
+    const canReadCollection = name => readableCollections().includes(name);
     const firestoreStorageAdapter = {
-      async load() {
+      async loadRoot() {
         const rootSnapshot = await getDoc(companyRef);
-        if (!rootSnapshot.exists()) return null;
-        const root = rootSnapshot.data() || {};
-        const database = createEmptyDatabase();
-        database.meta = { ...database.meta, ...(root.meta || {}) };
-        database.settings = { ...database.settings, ...(root.settings || {}) };
-        const readableCollections = isFieldRole() ? FIELD_COLLECTIONS : isWarehouseRole() ? WAREHOUSE_COLLECTIONS : FIRESTORE_COLLECTIONS;
-        const snapshots = await Promise.all(readableCollections.map(name => getDocs(companyCollection(name))));
-        snapshots.forEach((snapshot, index) => { database[readableCollections[index]] = snapshot.docs.map(item => item.data()); });
-        return database;
+        return rootSnapshot.exists() ? (rootSnapshot.data() || {}) : null;
       },
-      buildOperations(previous, next) {
+      // One live listener per collection. The first attach is billed; afterwards the SDK
+      // resumes from its cached state, so only genuinely changed documents cost a read.
+      watchCollection(name, onDocs, onError) {
+        return onSnapshot(companyCollection(name),
+          snapshot => onDocs(
+            snapshot.docs.map(item => ({ id: item.id, data: item.data() })),
+            snapshot.docChanges().map(change => ({ type: change.type, id: change.doc.id, data: change.doc.data() }))
+          ),
+          error => { console.error("Collection listener failed: " + name, error); onError?.(error); });
+      },
+      // Narrow one-off query for the append-only log collections, which are never held in memory.
+      async queryLog(name, field, value, sortField, take = 200) {
+        const build = withSort => {
+          const clauses = [companyCollection(name)];
+          if (field) clauses.push(where(field, "==", value));
+          if (withSort && sortField) clauses.push(orderBy(sortField, "desc"));
+          clauses.push(limit(take));
+          return query(...clauses);
+        };
+        try {
+          const snapshot = await getDocs(build(true));
+          return snapshot.docs.map(item => item.data());
+        } catch (error) {
+          // A field+sort query needs a composite index. Until it exists, fall back to an
+          // unsorted page and sort locally so the screen still works.
+          if (error?.code !== "failed-precondition") throw error;
+          console.warn("Composite index missing for " + name + "; using unsorted fallback", error);
+          const snapshot = await getDocs(build(false));
+          return snapshot.docs.map(item => item.data());
+        }
+      },
+      watchRoot(callback) {
+        return onSnapshot(companyRef, snapshot => callback(snapshot.exists() ? snapshot.data() : null),
+          error => console.error("Root listener failed", error));
+      },
+      // Diff against a baseline of pre-serialised records. The "before" side is serialised
+      // once when a document arrives, so a commit only has to serialise the draft — the
+      // single largest cost in the old path, which re-serialised both sides of every record.
+      // Unloaded collections can still receive appends (logs): an empty baseline never deletes.
+      buildOperations(baselines, next, scope) {
         const operations = [];
-        FIRESTORE_COLLECTIONS.forEach(name => {
-          const before = recordMap(name, previous?.[name] || []);
+        (scope || FIRESTORE_COLLECTIONS).forEach(name => {
+          const before = baselines.get(name) || new Map();
           const after = recordMap(name, next?.[name] || []);
-          before.forEach((record, identity) => {
+          before.forEach((json, identity) => {
             if (!after.has(identity)) operations.push({ type: "delete", ref: cloudRecordRef(name, identity) });
           });
           after.forEach((record, identity) => {
-            if (!before.has(identity) || !sameRecord(before.get(identity), record)) operations.push({ type: "set", ref: cloudRecordRef(name, identity), data: record });
+            if (before.get(identity) !== JSON.stringify(record)) operations.push({ type: "set", ref: cloudRecordRef(name, identity), data: record });
           });
         });
         return operations;
       },
-      async save(previous, next) {
-        const operations = this.buildOperations(previous, next);
+      // Baseline built from a plain object, for whole-database restore / clear.
+      baselinesFrom(source, scope) {
+        const maps = new Map();
+        (scope || FIRESTORE_COLLECTIONS).forEach(name => {
+          const map = new Map();
+          recordMap(name, source?.[name] || []).forEach((record, identity) => map.set(identity, JSON.stringify(record)));
+          maps.set(name, map);
+        });
+        return maps;
+      },
+      async save(baselines, expectedRevision, next, scope) {
+        const operations = this.buildOperations(baselines, next, scope);
         const rootData = { meta: next.meta, settings: next.settings };
-        const expectedRevision = Number(previous?.meta?.revision) || 0;
         if (operations.length <= 440) {
           await runTransaction(firestore, async transaction => {
             const rootSnapshot = await transaction.get(companyRef);
@@ -2258,56 +2357,171 @@
     const firebaseDataService = (() => {
       let database = null;
       let commitQueue = Promise.resolve();
-      let liveUnsubscribe = null;
       let liveRefreshTimer = null;
+      let onLiveChange = null;
+      let rootUnsubscribe = null;
+      const listeners = new Map();      // collection name -> unsubscribe
+      const loadedSet = new Set();      // collections with at least one snapshot delivered
+      const pendingAttach = new Map();  // collection name -> in-flight first-snapshot promise
 
-      const hydrateDatabase = loaded => {
-        if (!loaded) throw new Error("Your account is not ready. Contact the Administrator.");
-        if (loaded.meta?.schemaVersion !== SCHEMA_VERSION) throw new Error("The application needs an update. Contact the Administrator.");
-        const base = createEmptyDatabase();
-        FIRESTORE_COLLECTIONS.forEach(name => { base[name] = Array.isArray(loaded[name]) ? loaded[name] : []; });
-        base.meta = { ...base.meta, ...(loaded.meta || {}) };
-        base.settings = { ...base.settings, ...(loaded.settings || {}) };
-        database = normalizeDatabase(base);
+      const applyRootData = root => {
+        if (!root) throw new Error("Your account is not ready. Contact the Administrator.");
+        if (root.meta?.schemaVersion !== SCHEMA_VERSION) throw new Error("The application needs an update. Contact the Administrator.");
+        database.meta = { ...createEmptyDatabase().meta, ...(root.meta || {}) };
+        database.settings = { ...createEmptyDatabase().settings, ...(root.settings || {}) };
         database.meta.revision = Number(database.meta.revision) || 0;
         database.settings.operatingMode = operatingModeOf(database.settings);
-        database.models.forEach(model => { if (!clean(model.productName)) model.productName = productMasterName(model); });
-        return database;
       };
-      const refreshDatabase = async () => hydrateDatabase(await firestoreStorageAdapter.load());
+      // Normalisation is a repair/derive pass over the whole working set, so it runs only when
+      // a collection first arrives (and can therefore expose new cross-links). Documents that
+      // arrive later were written by this app in its current shape and need no repair.
+      const indexes = new Map();   // collection name -> Map(docId -> record)
+      const baselines = new Map(); // collection name -> Map(record identity -> serialised record)
+      // Some normalisation steps rebuild a collection array outright (quantity stock, activations,
+      // users). Those replacements must be pushed back into the index, or the next snapshot would
+      // rebuild the array from the index and silently undo the repair.
+      const resyncIndex = name => {
+        const index = indexes.get(name);
+        if (!index) return;
+        index.clear();
+        (database[name] || []).forEach(record => {
+          const identity = recordIdentity(name, record);
+          if (identity) index.set(documentIdFor(name, identity), record);
+        });
+      };
+      const renormalize = () => {
+        const before = new Map([...indexes.keys()].map(name => [name, database[name]]));
+        normalizeDatabase(database);
+        database.models.forEach(model => { if (!clean(model.productName)) model.productName = productMasterName(model); });
+        before.forEach((array, name) => { if (database[name] !== array) resyncIndex(name); });
+      };
+      const attachCollection = name => {
+        if (loadedSet.has(name)) return Promise.resolve();
+        if (pendingAttach.has(name)) return pendingAttach.get(name);
+        if (LOG_COLLECTIONS.includes(name) || !canReadCollection(name)) {
+          loadedSet.add(name);
+          return Promise.resolve();
+        }
+        const attachPromise = new Promise((resolve, reject) => {
+          let settled = false;
+          const index = new Map();
+          const baseline = new Map(); // record identity -> serialised form, the commit diff baseline
+          indexes.set(name, index);
+          baselines.set(name, baseline);
+          const remember = record => {
+            const identity = recordIdentity(name, record);
+            if (identity) baseline.set(identity, JSON.stringify(record));
+          };
+          const unsubscribe = firestoreStorageAdapter.watchCollection(name, (docs, changes) => {
+            if (!settled) {
+              docs.forEach(entry => { index.set(entry.id, entry.data); remember(entry.data); });
+            } else {
+              // Only the documents that actually changed are touched.
+              changes.forEach(change => {
+                if (change.type === "removed") {
+                  const identity = recordIdentity(name, index.get(change.id));
+                  index.delete(change.id);
+                  if (identity) baseline.delete(identity);
+                } else {
+                  index.set(change.id, change.data);
+                  remember(change.data);
+                }
+              });
+            }
+            database[name] = [...index.values()];
+            if (!settled) {
+              settled = true; loadedSet.add(name); pendingAttach.delete(name);
+              renormalize();
+              resolve();
+            } else scheduleLiveRefresh();
+          }, error => {
+            if (!settled) { settled = true; pendingAttach.delete(name); listeners.delete(name); indexes.delete(name); reject(error); }
+          });
+          listeners.set(name, unsubscribe);
+        });
+        pendingAttach.set(name, attachPromise);
+        return attachPromise;
+      };
+      // Attach only what the caller needs; anything already live costs nothing.
+      const ensureCollections = async names => {
+        const wanted = (names || []).filter(name => !loadedSet.has(name));
+        if (wanted.length) await Promise.all(wanted.map(attachCollection));
+      };
+      // Debounced: a burst of remote changes costs one normalise pass and one re-render.
+      const scheduleLiveRefresh = () => {
+        clearTimeout(liveRefreshTimer);
+        liveRefreshTimer = setTimeout(async () => {
+          try { renormalize(); await onLiveChange?.(); } catch (error) { console.error("Unable to apply live update", error); }
+        }, 250);
+      };
       const get = () => {
         if (!database) throw new Error("Data is not ready yet. Please try again.");
         return database;
       };
+      // Audit rows are append-only and never loaded, so they are queued as direct writes
+      // instead of being diffed against an in-memory list.
       const audit = (draft, action, recordType, recordId, oldValue, newValue) => {
-        draft.auditLogs.unshift({
+        draft.auditLogs.push({
           id: uid("AUD"), action, recordType, recordId,
           oldValue: oldValue === undefined ? null : oldValue,
           newValue: newValue === undefined ? null : newValue,
           user: currentUserName(), userUid: currentUserId, timestamp: nowISO()
         });
-        if (draft.auditLogs.length > 1000 && isBackOfficeRole()) draft.auditLogs.length = 1000;
       };
-      const runCommit = async mutator => {
+      // The draft shares record objects with the live database and only copies the arrays,
+      // so a commit costs nothing up front no matter how large a collection is. Mutators
+      // edit records in place; if the commit fails, restoreScope puts them back from the
+      // serialised baseline, which is the exact pre-commit state of every record.
+      const draftScope = scope => {
+        const draft = { ...database, meta: clone(database.meta), settings: clone(database.settings) };
+        scope.forEach(name => { draft[name] = (database[name] || []).slice(); });
+        LOG_COLLECTIONS.forEach(name => { draft[name] = []; });
+        return draft;
+      };
+      const restoreScope = scope => {
+        scope.forEach(name => {
+          const baseline = baselines.get(name);
+          const index = indexes.get(name);
+          if (!baseline || !index) return;
+          index.clear();
+          baseline.forEach((json, identity) => index.set(documentIdFor(name, identity), JSON.parse(json)));
+          database[name] = [...index.values()];
+        });
+      };
+      const runCommit = async (mutator, scope) => {
+        const writeScope = [...new Set([...scope, ...LOG_COLLECTIONS])];
         for (let attempt = 0; attempt < 3; attempt++) {
-          const current = clone(await refreshDatabase());
-          const draft = clone(current);
-          const result = await mutator(draft);
-          draft.meta.updatedAt = nowISO();
-          draft.meta.revision = (Number(current.meta.revision) || 0) + 1;
+          const expectedRevision = Number(database.meta.revision) || 0;
+          const draft = draftScope(scope);
+          let result;
           try {
-            await firestoreStorageAdapter.save(current, draft);
-            database = draft;
-            return clone(result);
+            result = await mutator(draft);
+            draft.meta = { ...database.meta, updatedAt: nowISO(), revision: expectedRevision + 1 };
+            await firestoreStorageAdapter.save(baselines, expectedRevision, draft, writeScope);
           } catch (error) {
+            restoreScope(scope);
             if (error?.code !== "cloud-revision-conflict" || attempt === 2) throw error;
+            // Let the live listeners deliver the newer state, then rebuild the draft and retry.
+            await new Promise(resolve => setTimeout(resolve, 220 * (attempt + 1)));
+            applyRootData(await firestoreStorageAdapter.loadRoot());
+            continue;
           }
+          // Mutators write fully-formed records, so no normalisation pass is needed here.
+          // The listener echo re-syncs each index and baseline from its own docChanges.
+          scope.forEach(name => { database[name] = draft[name]; });
+          database.meta = draft.meta;
+          database.settings = draft.settings;
+          return result;
         }
       };
-      const commit = mutator => {
-        const queued = commitQueue.then(() => {
-          if (navigator.locks?.request) return navigator.locks.request("infiniaa.firebase.write", () => runCommit(mutator));
-          return runCommit(mutator);
+      // `operation` names the mutation so its collection scope is attached before the
+      // draft is taken, and so only those collections are cloned and diffed.
+      const commit = (operation, mutator) => {
+        const scope = [...new Set([...CORE_COLLECTIONS, ...(MUTATION_COLLECTIONS[operation] || [])])].filter(canReadCollection);
+        const queued = commitQueue.then(async () => {
+          await ensureCollections(scope);
+          if (navigator.locks?.request) return navigator.locks.request("infiniaa.firebase.write", () => runCommit(mutator, scope));
+          return runCommit(mutator, scope);
         });
         commitQueue = queued.catch(() => undefined);
         return queued;
@@ -2625,30 +2839,47 @@
       };
 
       const service = {
-        async initialize() { await refreshDatabase(); return true; },
-        async getDatabase() { return clone(get()); },
-        async getSettings() { return clone(get().settings); },
-        startRealtime(onChange) {
-          liveUnsubscribe?.();
-          liveUnsubscribe = firestoreStorageAdapter.subscribe(root => {
-            const cloudRevision = Number(root?.meta?.revision) || 0;
-            if (!root || cloudRevision === (Number(database?.meta?.revision) || 0)) return;
-            clearTimeout(liveRefreshTimer);
-            liveRefreshTimer = setTimeout(async () => {
-              try {
-                await refreshDatabase();
-                await onChange?.();
-              } catch (error) { console.error("Unable to refresh cloud data", error); }
-            }, 250);
+        // Sign-in pulls the root document plus the small master collections only.
+        // Transaction data is attached later, per route.
+        async initialize() {
+          database = createEmptyDatabase();
+          applyRootData(await firestoreStorageAdapter.loadRoot());
+          // One listener on a single document keeps revision and settings current, so a
+          // concurrent write elsewhere does not cost this session a wasted conflict retry.
+          rootUnsubscribe?.();
+          rootUnsubscribe = firestoreStorageAdapter.watchRoot(root => {
+            if (!root || !database) return;
+            const cloudRevision = Number(root.meta?.revision) || 0;
+            if (cloudRevision === (Number(database.meta.revision) || 0)) return;
+            try { applyRootData(root); scheduleLiveRefresh(); } catch (error) { console.error(error); }
           });
+          await ensureCollections(CORE_COLLECTIONS.filter(canReadCollection));
+          return true;
         },
+        // Live arrays, not a deep copy: renderers read, they never mutate.
+        // Pass collection names when a caller needs data outside the current route.
+        async getDatabase(names) { if (names) await ensureCollections(names.filter(canReadCollection)); return get(); },
+        async getSettings() { return get().settings; },
+        // Attach whatever a route needs before it renders; already-live collections cost nothing.
+        async ensureRouteData(route) {
+          await ensureCollections((ROUTE_COLLECTIONS[route] || []).filter(canReadCollection));
+        },
+        loadedCollections() { return [...loadedSet]; },
+        startRealtime(onChange) { onLiveChange = onChange; },
         stopRealtime() {
           clearTimeout(liveRefreshTimer);
-          liveUnsubscribe?.();
-          liveUnsubscribe = null;
+          onLiveChange = null;
+          rootUnsubscribe?.(); rootUnsubscribe = null;
+          listeners.forEach(unsubscribe => { try { unsubscribe(); } catch (error) { console.error(error); } });
+          listeners.clear(); loadedSet.clear(); pendingAttach.clear(); indexes.clear();
+          database = null;
         },
+        // Narrow, on-demand reads for the append-only logs that are never held in memory.
+        async getAuditLogs(take = 100) { return firestoreStorageAdapter.queryLog("auditLogs", null, null, "timestamp", take); },
+        async getPriceLogs(modelId, take = 100) { return firestoreStorageAdapter.queryLog("priceLogs", "modelId", modelId, "changedAt", take); },
+        async getStockMovements(modelId, take = 200) { return firestoreStorageAdapter.queryLog("stockMovements", "modelId", modelId, "createdAt", take); },
         async saveSettings(values) {
-          return commit(draft => {
+          return commit("saveSettings", draft => {
             const nextValues = { ...values };
             if (nextValues.operatingMode !== undefined) {
               if (!isSupportedOperatingMode(nextValues.operatingMode)) throw new Error("Select a valid operating mode");
@@ -2662,22 +2893,22 @@
           });
         },
         async saveBrand(values) {
-          return commit(draft => applyBrand(draft, values));
+          return commit("saveBrand", draft => applyBrand(draft, values));
         },
         async saveBulkBrands(records) {
-          return commit(draft => records.map(values => applyBrand(draft, values)));
+          return commit("saveBulkBrands", draft => records.map(values => applyBrand(draft, values)));
         },
         async saveModel(values) {
-          return commit(draft => applyModel(draft, values));
+          return commit("saveModel", draft => applyModel(draft, values));
         },
         async saveBulkModels(records) {
-          return commit(draft => records.map(values => applyModel(draft, values)));
+          return commit("saveBulkModels", draft => records.map(values => applyModel(draft, values)));
         },
         async saveParty(values) {
-          return commit(draft => applyParty(draft, values));
+          return commit("saveParty", draft => applyParty(draft, values));
         },
         async saveBulkParties(records) {
-          return commit(draft => records.map(values => applyParty(draft, values)));
+          return commit("saveBulkParties", draft => records.map(values => applyParty(draft, values)));
         },
         async saveUser(values) {
           if(!isAdminRole())throw new Error("Only Admin can manage users");
@@ -2687,7 +2918,7 @@
           let provisioned=null;
           if(isNew)provisioned=await provisionFirebaseUser(email,password);
           try{
-            const result=await commit(draft=>{
+            const result=await commit("saveUser", draft=>{
               const name=clean(values.name),role=clean(values.role).toUpperCase(),status=values.status==="INACTIVE"?"INACTIVE":"ACTIVE";
               if(!name)throw new Error("User name is required");
               if(!Object.values(ROLES).includes(role))throw new Error("Select a valid user role");
@@ -2724,13 +2955,13 @@
           }).slice(0, 12));
         },
         async saveExpenseHead(values) {
-          return commit(draft => applyExpenseHead(draft, values));
+          return commit("saveExpenseHead", draft => applyExpenseHead(draft, values));
         },
         async saveBulkExpenseHeads(records) {
-          return commit(draft => records.map(values => applyExpenseHead(draft, values)));
+          return commit("saveBulkExpenseHeads", draft => records.map(values => applyExpenseHead(draft, values)));
         },
         async savePurchaseOrder(input) {
-          return commit(draft => {
+          return commit("savePurchaseOrder", draft => {
             if (!isBackOfficeRole()) throw new Error("Only Admin or Back Office can create purchase quantity orders");
             const supplier=byId(draft.parties,input.supplierId,"Supplier");
             if(!partyCanSupply(supplier))throw new Error("Select an active supplier");
@@ -2755,7 +2986,7 @@
           });
         },
         async cancelPurchaseOrder(id) {
-          return commit(draft=>{
+          return commit("cancelPurchaseOrder", draft=>{
             if(!isBackOfficeRole())throw new Error("Only Admin or Back Office can cancel purchase orders");
             const order=byId(draft.purchaseOrders,id,"Purchase order");
             if(order.status!=="PENDING")throw new Error("Only pending purchase orders can be cancelled");
@@ -2765,7 +2996,7 @@
           });
         },
         async savePurchase(input) {
-          return commit(draft => {
+          return commit("savePurchase", draft => {
             const supplier = byId(draft.parties, input.supplierId, "Supplier");
             if (!partyCanSupply(supplier)) throw new Error("Selected party cannot be used as a supplier");
             const invoiceNumber = clean(input.invoiceNumber);
@@ -2903,7 +3134,7 @@
           });
         },
         async saveBulkPurchases(rows) {
-          return commit(draft => {
+          return commit("saveBulkPurchases", draft => {
             if (!Array.isArray(rows) || !rows.length) throw new Error("No valid rows to import");
             ensureUniqueIMEIs(rows);
             const existing = new Set(draft.inventory.map(row => row.imei));
@@ -2956,7 +3187,7 @@
           });
         },
         async importActivations(records, sourceFile) {
-          return commit(draft => {
+          return commit("importActivations", draft => {
             if (!Array.isArray(records) || !records.length) throw new Error("No activation records to import");
             const inventoryMap = new Map(draft.inventory.map(row => [row.imei, row]));
             const latestRows = new Map();
@@ -3006,7 +3237,7 @@
           });
         },
         async saveSaleOrder(input) {
-          return commit(draft => {
+          return commit("saveSaleOrder", draft => {
             if (!isBackOfficeRole()) throw new Error("Only Admin or Back Office can create quantity orders");
             const party = byId(draft.parties, input.partyId, "Party");
             if (!partyCanBuy(party)) throw new Error("Select an active customer/dealer");
@@ -3048,7 +3279,7 @@
           });
         },
         async cancelSaleOrder(id) {
-          return commit(draft => {
+          return commit("cancelSaleOrder", draft => {
             if (!isBackOfficeRole()) throw new Error("Only Admin or Back Office can cancel quantity orders");
             const order = byId(draft.saleOrders, id, "Sale order");
             if (order.status !== "PENDING") throw new Error("Only pending orders can be cancelled");
@@ -3059,7 +3290,7 @@
           });
         },
         async saveSale(input) {
-          return commit(draft => {
+          return commit("saveSale", draft => {
             const billingMode = operatingModeOf(draft.settings);
             const tallyParallel = billingMode === OPERATING_MODE.TALLY_PARALLEL;
             const orderId=clean(input.orderId),order=orderId?byId(draft.saleOrders,orderId,"Sale order"):null;
@@ -3209,7 +3440,7 @@
               const voucherNumber = nextDocumentNo(draft.payments.filter(row => row.type === MONEY_TX_TYPE.COLLECTION), "RCT", "voucherNumber");
               collectionRecord = {
                 id: uid("PMT"), voucherNumber, type: MONEY_TX_TYPE.COLLECTION, date: invoiceDate, partyId: customer.id, partyName: customer.name,
-                partySnapshot: clone(customer), amount: amountReceivedNow, mode: receivedMode, reference: invoiceNumber,
+                partySnapshot: clone(customer), amount: amountReceivedNow, mode: receivedMode, reference: invoiceNumber, linkedSaleId: id,
                 remarks: "Received at billing against " + invoiceNumber, status: MONEY_STATUS.POSTED, createdBy: currentUserName(), createdAt: nowISO()
               };
               draft.payments.unshift(collectionRecord);
@@ -3255,7 +3486,7 @@
           });
         },
         async cancelSale(id) {
-          return commit(draft => {
+          return commit("cancelSale", draft => {
             const sale = byId(draft.sales, id, "Sale");
             if (sale.status === "CANCELLED") throw new Error("Sale is already cancelled");
             const returned = draft.returns.some(row => row.type === "SALES_RETURN" && row.saleId === id);
@@ -3288,6 +3519,19 @@
               inventory.updatedAt = nowISO();
             });
             audit(draft, "Sale Cancelled", "SALE", id, oldValue, { status: sale.status });
+            const billingRemark = "Received at billing against " + sale.invoiceNumber;
+            const voidedCollections = draft.payments.filter(row =>
+              row.type === MONEY_TX_TYPE.COLLECTION && row.status === MONEY_STATUS.POSTED
+              && (row.linkedSaleId === sale.id
+                || (!row.linkedSaleId && !row.linkedPlanId && row.partyId === sale.customerId && clean(row.remarks) === billingRemark))
+            );
+            voidedCollections.forEach(row => {
+              row.status = MONEY_STATUS.VOIDED;
+              row.voidedBy = currentUserName();
+              row.voidedAt = nowISO();
+              row.voidReason = "Sales invoice " + sale.invoiceNumber + " voided";
+              audit(draft, "Collection Voucher Voided", "PAYMENT", row.id, { status: MONEY_STATUS.POSTED }, { status: MONEY_STATUS.VOIDED, reason: row.voidReason });
+            });
             const saleIMEIs = sale.items.filter(row => row.trackingMode !== TRACKING_MODE.QUANTITY).map(row => row.imei);
             if (saleIMEIs.length) audit(draft, "IMEI Status Changed", "INVENTORY_BATCH", id, { stockStatus: STATUS.SOLD }, { imeis: saleIMEIs, stockStatus: "RESTORED" });
             let reopenedOrder = null;
@@ -3311,11 +3555,11 @@
                 }
               }
             }
-            return { sale, reopenedOrder };
+            return { sale, reopenedOrder, voidedCollections };
           });
         },
         async saveReturn(input) {
-          return commit(draft => {
+          return commit("saveReturn", draft => {
             const imei = clean(input.imei);
             if (!isValidIMEI(imei)) throw new Error("Enter a valid Serial / IMEI (6–40 supported characters)");
             const inventory = draft.inventory.find(row => row.imei === imei);
@@ -3374,7 +3618,7 @@
           });
         },
         async saveQuantityReturn(input) {
-          return commit(draft => {
+          return commit("saveQuantityReturn", draft => {
             const type = clean(input.type);
             if (!["PURCHASE_RETURN","SALES_RETURN"].includes(type)) throw new Error("Invalid return type");
             const source = type === "SALES_RETURN" ? byId(draft.sales, input.sourceId, "Original sale") : byId(draft.purchases, input.sourceId, "Original purchase");
@@ -3442,7 +3686,7 @@
           });
         },
         async saveExpense(values) {
-          return commit(draft => {
+          return commit("saveExpense", draft => {
             const head = byId(draft.expenseHeads, values.expenseHeadId, "Expense head");
             const amount = Number(values.amount);
             if (!isValidDateISO(values.date) || !Number.isFinite(amount) || amount <= 0) throw new Error("Date and a valid amount are required");
@@ -3465,7 +3709,7 @@
           });
         },
         async saveNote(values) {
-          return commit(draft => {
+          return commit("saveNote", draft => {
             const type = clean(values.type).toUpperCase();
             const effect = clean(values.effect).toUpperCase();
             const ledgerSide = clean(values.ledgerSide).toUpperCase();
@@ -3492,7 +3736,7 @@
           });
         },
         async saveFieldOrder(input) {
-          return commit(draft=>{
+          return commit("saveFieldOrder", draft=>{
             if(currentRole!==ROLES.SALESMAN)throw new Error("Only a Salesman login can submit a field order");
             const salesman=byId(draft.users,currentUserId,"Salesman");
             if(salesman.role!==ROLES.SALESMAN||salesman.status!=="ACTIVE")throw new Error("Active Salesman login required");
@@ -3513,14 +3757,14 @@
           });
         },
         async reviewFieldOrder(id,decision,reason="") {
-          return commit(draft=>{
+          return commit("reviewFieldOrder", draft=>{
             if(currentRole!==ROLES.SALES_HEAD)throw new Error("Only the mapped Sales Head can approve or reject this order");
             const order=byId(draft.fieldOrders,id,"Field order"),salesman=draft.users.find(user=>user.id===order.salesmanUserId&&user.role===ROLES.SALESMAN);if(salesman?.reportsToUserId!==currentUserId)throw new Error("This order is outside your current team mapping");if(order.status!=="SUBMITTED")throw new Error("Only submitted orders can be reviewed");
             const approved=decision==="APPROVE";if(!approved&&!clean(reason))throw new Error("Enter a rejection reason");const oldValue={status:order.status};order.status=approved?"APPROVED":"REJECTED";order.reviewReason=clean(reason);order.reviewedBy=currentUserName();order.reviewedAt=nowISO();audit(draft,approved?"Field Order Approved":"Field Order Rejected","FIELD_ORDER",id,oldValue,{status:order.status,reason:order.reviewReason});return order;
           });
         },
         async sendFieldOrderToBilling(id) {
-          return commit(draft=>{
+          return commit("sendFieldOrderToBilling", draft=>{
             if(!isBackOfficeRole())throw new Error("Only Admin or Back Office can send an approved order to billing");
             const fieldOrder=byId(draft.fieldOrders,id,"Field order");if(fieldOrder.status!=="APPROVED")throw new Error("Sales Head approval is required before billing");
             const party=byId(draft.parties,fieldOrder.partyId,"Party");if(!partyCanBuy(party))throw new Error("Mapped party is not active");
@@ -3531,7 +3775,7 @@
           });
         },
         async saveCollectionPlan(input) {
-          return commit(draft=>{
+          return commit("saveCollectionPlan", draft=>{
             if(currentRole!==ROLES.SALESMAN)throw new Error("Only a Salesman login can submit a collection plan");
             const salesman=byId(draft.users,currentUserId,"Salesman"),salesHead=draft.users.find(user=>user.id===salesman.reportsToUserId&&user.role===ROLES.SALES_HEAD&&user.status==="ACTIVE");if(!salesHead)throw new Error("Ask Admin to map this Salesman to an active Sales Head");
             const party=byId(draft.parties,input.partyId,"Party");if(!partyCanBuy(party)||party.salesmanUserId!==salesman.id)throw new Error("Select a party mapped to your Salesman login");
@@ -3543,7 +3787,7 @@
           });
         },
         async savePlanReceipt(input) {
-          return commit(draft=>{
+          return commit("savePlanReceipt", draft=>{
             if(!isBackOfficeRole())throw new Error("Only Admin or Back Office can update received collection");
             const plan=byId(draft.collectionPlans,input.planId,"Collection plan"),party=byId(draft.parties,plan.partyId,"Party");
             const date=clean(input.date)||plan.date,amount=Number(input.amount),mode=clean(input.mode).toUpperCase();if(!isValidDateISO(date)||!Number.isFinite(amount)||amount<=0)throw new Error("Date and a valid received amount are required");if(!PAYMENT_MODES.includes(mode))throw new Error("Select a valid payment mode");
@@ -3553,7 +3797,7 @@
           });
         },
         async saveMoneyTransaction(values) {
-          return commit(draft => {
+          return commit("saveMoneyTransaction", draft => {
             if (!isBackOfficeRole()) throw new Error("Only Admin or Back Office can post collection or payment vouchers");
             const type = clean(values.type).toUpperCase();
             if (!Object.values(MONEY_TX_TYPE).includes(type)) throw new Error("Select Collection or Payment");
@@ -3580,7 +3824,7 @@
           });
         },
         async voidMoneyTransaction(id) {
-          return commit(draft => {
+          return commit("voidMoneyTransaction", draft => {
             if (!isBackOfficeRole()) throw new Error("Only Admin or Back Office can void collection or payment vouchers");
             const record = byId(draft.payments, id, "Voucher");
             if (record.status === MONEY_STATUS.VOIDED) throw new Error("Voucher is already voided");
@@ -3594,21 +3838,23 @@
           });
         },
         async getIMEIHistory(imei) {
+          await ensureCollections(["inventory","purchases","sales","returns","activations"].filter(canReadCollection));
           const db = get();
           const inventory = db.inventory.find(row => row.imei === clean(imei));
           if (!inventory) return null;
           return clone({
             inventory,
             purchase: db.purchases.find(row => row.id === inventory.purchaseId) || null,
-            activations: db.activations.filter(row => row.imei === inventory.imei),
+            activations: (db.activations || []).filter(row => row.imei === inventory.imei),
             sales: db.sales.filter(row => row.items.some(item => item.imei === inventory.imei)),
             returns: db.returns.filter(row => row.imei === inventory.imei)
           });
         },
         async globalSearch(term) {
-          const db = get();
           const needle = lower(term);
           if (!needle) return [];
+          await ensureCollections(["inventory","sales","payments"].filter(canReadCollection));
+          const db = get();
           const results = [];
           db.inventory.filter(row => [row.imei,row.customerName,row.customerMobile].some(value => lower(value).includes(needle))).slice(0, 6).forEach(row => results.push({ type: "IMEI", id: row.imei, title: row.imei, subtitle: [statusLabel(row.stockStatus),row.customerName,row.customerMobile].filter(Boolean).join(" · ") }));
           db.sales.filter(row => [row.invoiceNumber,row.customerName,row.customerMobile,row.customerSnapshot?.address,row.customerSnapshot?.area].some(value => lower(value).includes(needle))).slice(0, 5).forEach(row => results.push({ type: "INVOICE", id: row.id, title: row.invoiceNumber, subtitle: [customerTypeLabel(row),row.customerName,row.customerMobile].filter(Boolean).join(" · ") }));
@@ -3617,6 +3863,7 @@
           return clone(results.slice(0, 12));
         },
         async getFinancials(from, to) {
+          await ensureCollections(["sales","returns","expenses","notes"].filter(canReadCollection));
           const db = get();
           const sales = db.sales.filter(row => row.status === ACTIVE_SALE);
           const salesEvents = [];
@@ -3666,10 +3913,27 @@
             events: salesEvents, brandWise: aggregate("brand"), modelWise: aggregate("model")
           });
         },
-        async exportBackup() { return JSON.stringify(get(), null, 2); },
+        // Backup / restore / clear are the only whole-database operations left. They pull
+        // every collection on purpose, including the append-only logs.
+        async loadEverything() {
+          await ensureCollections(readableCollections().filter(name => !LOG_COLLECTIONS.includes(name)));
+          const logs = {};
+          if (isAdminRole()) {
+            await Promise.all(LOG_COLLECTIONS.map(async name => {
+              const snapshot = await getDocs(companyCollection(name));
+              logs[name] = snapshot.docs.map(item => item.data());
+            }));
+          }
+          return logs;
+        },
+        async exportBackup() {
+          const logs = await this.loadEverything();
+          return JSON.stringify({ ...get(), ...logs }, null, 2);
+        },
         async importBackup(candidate) {
           if(!isAdminRole())throw new Error("Only Admin can restore a backup");
-          const current=clone(await refreshDatabase());
+          const logs = await this.loadEverything();
+          const current={ ...clone(get()), ...logs };
           const incoming=clone(candidate);
           validateDatabase(incoming);
           let restored = normalizeDatabase(incoming);
@@ -3678,23 +3942,27 @@
           restored.settings = { ...createEmptyDatabase().settings, ...restored.settings };
           restored.settings.operatingMode = operatingModeOf(restored.settings);
           restored.meta = { ...current.meta, updatedAt: nowISO(), revision:(Number(current.meta.revision)||0)+1 };
-          await firestoreStorageAdapter.save(current,restored);
-          database = restored;
+          await firestoreStorageAdapter.save(firestoreStorageAdapter.baselinesFrom(current,FIRESTORE_COLLECTIONS),Number(current.meta.revision)||0,restored,FIRESTORE_COLLECTIONS);
+          FIRESTORE_COLLECTIONS.forEach(name => { if (!LOG_COLLECTIONS.includes(name)) database[name] = restored[name] || []; });
+          database.meta = restored.meta; database.settings = restored.settings;
           return true;
         },
         async clearAllData() {
           if(!isAdminRole())throw new Error("Only Admin can clear business data");
-          const current=clone(await refreshDatabase());
+          const logs = await this.loadEverything();
+          const current={ ...clone(get()), ...logs };
           const next = createEmptyDatabase();
           next.settings = clone(current.settings);
           next.users = clone(current.users);
           next.meta = { ...current.meta, updatedAt:nowISO(), revision:(Number(current.meta.revision)||0)+1 };
-          await firestoreStorageAdapter.save(current,next);
-          database = next;
+          await firestoreStorageAdapter.save(firestoreStorageAdapter.baselinesFrom(current,FIRESTORE_COLLECTIONS),Number(current.meta.revision)||0,next,FIRESTORE_COLLECTIONS);
+          FIRESTORE_COLLECTIONS.forEach(name => { if (!LOG_COLLECTIONS.includes(name)) database[name] = next[name] || []; });
+          database.meta = next.meta; database.settings = next.settings;
           return true;
         },
+        // Listeners already stream every change; this just re-reads the root revision.
         async refreshCloud() {
-          await refreshDatabase();
+          applyRootData(await firestoreStorageAdapter.loadRoot());
           return true;
         }
       };
@@ -3947,12 +4215,19 @@
       presets.push({ id: "custom", label: "Custom" });
       return `<div class="segmented">${presets.map(item => `<button class="${active === item.id ? "active" : ""}" data-action="${action}" data-preset="${item.id}">${item.label}</button>`).join("")}</div>`;
     };
+    // History tables grow without limit, so every one of them renders a bounded slice.
+    // The full set is still searchable, filterable and exportable to CSV.
+    const LIST_LIMIT = 200;
+    const capRows = rows => rows.length > LIST_LIMIT ? rows.slice(0, LIST_LIMIT) : rows;
+    const capNote = (rows, label = "records") => rows.length > LIST_LIMIT
+      ? `<div class="pagination"><span>Showing the newest ${LIST_LIMIT} of ${number(rows.length)} ${esc(label)}. Narrow the search or date range, or export to CSV for the full list.</span></div>`
+      : "";
     const kpiCard = (label, value, foot = "", tone = "") => `
       <div class="card kpi"><div class="kpi-label">${esc(label)}</div><div class="kpi-value ${tone}">${value}</div>${foot ? `<div class="kpi-foot">${foot}</div>` : ""}</div>`;
     const modalRoot = $("#modal-root");
     const drawerRoot = $("#drawer-root");
-    let modalReturnFocus = null, drawerReturnFocus = null;
-    const closeModal = () => { modalRoot.innerHTML = ""; if(modalReturnFocus?.isConnected)modalReturnFocus.focus(); modalReturnFocus=null; };
+    let modalReturnFocus = null, drawerReturnFocus = null, pendingConfirm = null;
+    const closeModal = () => { const dismissed=pendingConfirm; pendingConfirm=null; modalRoot.innerHTML = ""; if(modalReturnFocus?.isConnected)modalReturnFocus.focus(); modalReturnFocus=null; dismissed?.(false); };
     const closeDrawer = () => { drawerRoot.innerHTML = ""; if(drawerReturnFocus?.isConnected)drawerReturnFocus.focus(); drawerReturnFocus=null; };
     const showModal = ({ title, subtitle = "", body = "", footer = "", size = "" }) => {
       modalReturnFocus = document.activeElement;
@@ -3975,8 +4250,10 @@
         size: "modal-sm",
         footer: `<button class="btn" id="confirm-cancel">Cancel</button><button class="btn ${danger ? "btn-danger" : "btn-primary"}" id="confirm-ok">${esc(confirmLabel)}</button>`
       });
-      $("#confirm-cancel").onclick = () => { closeModal(); resolve(false); };
-      $("#confirm-ok").onclick = () => { closeModal(); resolve(true); };
+      pendingConfirm = resolve;
+      const settle = value => { pendingConfirm = null; closeModal(); resolve(value); };
+      $("#confirm-cancel").onclick = () => settle(false);
+      $("#confirm-ok").onclick = () => settle(true);
     });
     const toast = (message, type = "success", detail = "") => {
       const root = $("#toast-root");
@@ -4060,7 +4337,7 @@
     };
     const modalTable = (headers, rows, emptyText = "No records") => rows.length ? `
       <div class="table-wrap"><table><thead><tr>${headers.map(row => `<th>${esc(row.label)}</th>`).join("")}</tr></thead>
-      <tbody>${rows.map(row => `<tr>${headers.map(column => `<td>${column.render ? column.render(row) : esc(row[column.key])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`
+      <tbody>${capRows(rows).map(row => `<tr>${headers.map(column => `<td>${column.render ? column.render(row) : esc(row[column.key])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>${capNote(rows)}`
       : emptyState(emptyText, "There is nothing to display for this selection.");
 
     const financialFromDb = (db, from, to) => {
@@ -4271,7 +4548,7 @@
 
     // Purchase module
     const renderPurchase = async db => {
-      if (!state.purchaseDraft.invoiceNumber) state.purchaseDraft.invoiceNumber = "PI-" + String(db.purchases.length + 1001);
+      if (!state.purchaseDraft.invoiceNumber) state.purchaseDraft.invoiceNumber = nextDocumentPreview(db.purchases, "PI", "invoiceNumber");
       if (!state.purchaseDraft.invoiceDate) state.purchaseDraft.invoiceDate = localDateISO();
       const receiveOrder=db.purchaseOrders.find(row=>row.id===state.purchaseReceiveDraft.orderId&&row.status==="PENDING");
       const purchaseTabs = isWarehouseRole() ? [{id:"new",label:"New Purchase"},{id:"pending",label:"Pending Qty Orders"},{id:"history",label:"Purchase History"}] : [{id:"new",label:"New Purchase"},{id:"order",label:"Create Qty Order"},{id:"pending",label:"Pending Qty Orders"},{id:"import",label:"CSV Import"},{id:"history",label:"Purchase History"}];
@@ -4406,7 +4683,7 @@
           ${quantityTracked&&selectedModel&&expectedPurchaseQty?`<div class="table-wrap"><table><thead><tr><th>Brand</th><th>Product</th><th>Tracking</th><th>Quantity</th>${isWarehouseRole()?"":"<th>Unit Cost</th><th>Stock Value</th>"}</tr></thead><tbody><tr><td>${esc(maps.brands.get(selectedModel.brandId)?.name||"")}</td><td class="cell-main">${esc(productMasterName(selectedModel))}</td><td><span class="badge badge-info">Quantity Only</span></td><td><strong>${expectedPurchaseQty}</strong></td>${isWarehouseRole()?"":`<td class="money">${money(selectedModel.purchaseRate)}</td><td class="money">${money(purchaseValue)}</td>`}</tr></tbody></table></div>`:draft.items.length ? `<div class="table-wrap"><table><thead><tr><th>Sl</th><th>Serial / IMEI</th><th>Brand</th><th>Product</th>${isWarehouseRole()?"":"<th>Master Purchase Price</th>"}<th></th></tr></thead>
           <tbody>${draft.items.map((row,index) => {
             const model = maps.models.get(row.modelId), brand = maps.brands.get(model?.brandId);
-            return `<tr><td>${index+1}</td><td class="mono cell-main">${row.imei}</td><td>${esc(brand?.name||"")}</td><td>${esc(productMasterName(model))}</td>${isWarehouseRole()?"":`<td class="money">${money(row.purchaseRate)}</td>`}<td><button class="btn btn-sm btn-ghost negative" data-action="remove-purchase-item" data-index="${index}">Remove</button></td></tr>`;
+            return `<tr><td>${index+1}</td><td class="mono cell-main">${esc(row.imei)}</td><td>${esc(brand?.name||"")}</td><td>${esc(productMasterName(model))}</td>${isWarehouseRole()?"":`<td class="money">${money(row.purchaseRate)}</td>`}<td><button class="btn btn-sm btn-ghost negative" data-action="remove-purchase-item" data-index="${index}">Remove</button></td></tr>`;
           }).join("")}</tbody></table></div>` : emptyState(quantityTracked?"Enter purchase quantity":"No items scanned",quantityTracked?"Quantity-only products do not require a Serial / IMEI.":"Select a product, then scan or paste Serial / IMEI.",quantityTracked?"inventory":"scanner")}
         </section>
       </div>`;
@@ -4443,7 +4720,7 @@
       const rows = [...db.purchases].sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)));
       return `<section class="card"><div class="toolbar"><strong>${rows.length} purchases</strong><div class="toolbar-spacer"></div><button class="btn btn-sm" data-action="export-purchases">${icon("download")}CSV Export</button></div>
         ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Date</th><th>Supplier</th><th>Qty</th>${isWarehouseRole()?"":"<th>Stock Value</th>"}<th>Status</th><th></th></tr></thead><tbody>
-        ${rows.map(row=>`<tr><td class="cell-main">${esc(row.invoiceNumber)}</td><td>${dateFmt(row.invoiceDate)}</td><td>${esc(row.supplierName)}</td><td>${row.totalQty}</td>${isWarehouseRole()?"":`<td class="money">${money(row.totalValue)}</td>`}<td>${statusBadge(row.status)}</td><td><button class="btn btn-sm" data-action="view-purchase" data-id="${row.id}">View</button></td></tr>`).join("")}</tbody></table></div>` : emptyState("No purchases yet","Create the first purchase entry.")}
+        ${capRows(rows).map(row=>`<tr><td class="cell-main">${esc(row.invoiceNumber)}</td><td>${dateFmt(row.invoiceDate)}</td><td>${esc(row.supplierName)}</td><td>${row.totalQty}</td>${isWarehouseRole()?"":`<td class="money">${money(row.totalValue)}</td>`}<td>${statusBadge(row.status)}</td><td><button class="btn btn-sm" data-action="view-purchase" data-id="${row.id}">View</button></td></tr>`).join("")}</tbody></table></div>${capNote(rows,"purchases")}` : emptyState("No purchases yet","Create the first purchase entry.")}
       </section>`;
     };
 
@@ -4511,11 +4788,11 @@
       </div>`;
     };
     const showModelStock=async modelId=>{
-      const db=await dataService.getDatabase(),maps=getMaps(db),model=maps.models.get(modelId),brand=maps.brands.get(model?.brandId),items=currentStockItems(db).filter(row=>row.modelId===modelId).sort((a,b)=>String(b.updatedAt).localeCompare(String(a.updatedAt)));
+      const db=await dataService.getDatabase(["inventory"]),maps=getMaps(db),model=maps.models.get(modelId),brand=maps.brands.get(model?.brandId),items=currentStockItems(db).filter(row=>row.modelId===modelId).sort((a,b)=>String(b.updatedAt).localeCompare(String(a.updatedAt)));
       if(!model){toast("Product not found","error");return;}
       if(isQuantityTracked(model)){
         const stock=db.quantityStock.find(row=>row.modelId===modelId)||{quantity:0,damagedQty:0,averageCost:0};
-        const movements=db.stockMovements.filter(row=>row.modelId===modelId).sort((a,b)=>String(b.createdAt||b.date).localeCompare(String(a.createdAt||a.date)));
+        const movements=(await dataService.getStockMovements(modelId)).sort((a,b)=>String(b.createdAt||b.date).localeCompare(String(a.createdAt||a.date)));
         const stats=[["Total Qty",Number(stock.quantity)+Number(stock.damagedQty)],["Available",Number(stock.quantity)],["Damaged",Number(stock.damagedQty)]];
         if(!isWarehouseRole())stats.push(["Average Cost",money(stock.averageCost||0)],["Stock Value",money((Number(stock.quantity)+Number(stock.damagedQty))*Number(stock.averageCost||0))]);
         const columns=[{label:"Date",render:row=>dateFmt(row.date)},{label:"Movement",render:row=>esc(statusLabel(row.type))},{label:"Reference",render:row=>`<div class="cell-main">${esc(row.referenceNumber||"—")}</div><div class="cell-sub">${esc(row.partyName||"")}</div>`},{label:"Available Change",render:row=>`<strong class="${Number(row.availableChange)<0?"negative":"positive"}">${Number(row.availableChange)>0?"+":""}${number(row.availableChange)}</strong>`},{label:"Damaged Change",render:row=>number(row.damagedChange||0)}];
@@ -4569,7 +4846,7 @@
             ${state.inventoryAging ? `<button class="btn btn-sm" data-action="clear-aging-filter">Clear ${esc(state.inventoryAging)}</button>` : ""}
           </div>
           ${pageRows.length ? `<div class="table-wrap"><table><thead><tr><th>Serial / IMEI</th><th>Product</th><th>Purchase</th><th>Cost</th><th>Supplier</th><th>Age</th><th>Activation</th><th>Status</th></tr></thead><tbody>
-          ${pageRows.map(row=>{ const p=productName(row,maps); return `<tr data-action="imei-360" data-imei="${row.imei}" style="cursor:pointer"><td class="mono cell-main">${row.imei}</td><td><div class="cell-main">${esc(p.brand)}</div><div class="cell-sub">${esc(p.model)}</div></td><td><div>${dateFmt(row.purchaseDate)}</div><div class="cell-sub">${esc(row.purchaseInvoice)}</div></td><td class="money">${money(row.purchaseRate)}</td><td>${esc(row.supplierName)}</td><td><div class="cell-main">${daysOld(row.purchaseDate)} days</div><div class="cell-sub">${agingBucket(daysOld(row.purchaseDate))}</div></td><td>${statusBadge(row.activation?.status||"NOT_ACTIVATED")}</td><td>${statusBadge(row.stockStatus)}</td></tr>`;}).join("")}
+          ${pageRows.map(row=>{ const p=productName(row,maps); return `<tr data-action="imei-360" data-imei="${attr(row.imei)}" style="cursor:pointer"><td class="mono cell-main">${esc(row.imei)}</td><td><div class="cell-main">${esc(p.brand)}</div><div class="cell-sub">${esc(p.model)}</div></td><td><div>${dateFmt(row.purchaseDate)}</div><div class="cell-sub">${esc(row.purchaseInvoice)}</div></td><td class="money">${money(row.purchaseRate)}</td><td>${esc(row.supplierName)}</td><td><div class="cell-main">${daysOld(row.purchaseDate)} days</div><div class="cell-sub">${agingBucket(daysOld(row.purchaseDate))}</div></td><td>${statusBadge(row.activation?.status||"NOT_ACTIVATED")}</td><td>${statusBadge(row.stockStatus)}</td></tr>`;}).join("")}
           </tbody></table></div>
           <div class="pagination"><span>Showing ${(state.inventoryPage-1)*PAGE_SIZE+1}–${Math.min(state.inventoryPage*PAGE_SIZE,rows.length)} of ${rows.length}</span><div class="inline-actions"><button class="btn btn-sm" data-action="inventory-page" data-page="${state.inventoryPage-1}" ${state.inventoryPage<=1?"disabled":""}>Previous</button><span>Page ${state.inventoryPage} / ${pageCount}</span><button class="btn btn-sm" data-action="inventory-page" data-page="${state.inventoryPage+1}" ${state.inventoryPage>=pageCount?"disabled":""}>Next</button></div></div>`
           : emptyState("No matching IMEIs","Adjust the search or filters to see inventory.","inventory")}
@@ -4634,13 +4911,13 @@
         <div class="card-body"><div class="stats-strip">${[["Total IMEI",rows.length],["Activated",activated.length],["Not Activated",rows.length-activated.length],["Activation %",percent(activated.length,rows.length).toFixed(1)+"%"],["Activated Stock",activatedStock],["Activated Sold Units",activatedSold]].map(([label,value])=>`<div class="mini-stat"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div>
           <div class="inline-actions" style="justify-content:flex-end"><button class="btn btn-sm" data-action="export-activation-report">${icon("download")}CSV Export</button></div></div>
         ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Serial / IMEI</th><th>Brand</th><th>Product</th><th>Customer / Buyer</th><th>Sale Date</th><th>Activation Date</th><th>Activation</th><th>Current Status</th></tr></thead><tbody>
-        ${pageRows.map(row=>{const p=productName(row,maps),buyer=activationParty(row),mobile=activationMobile(row),cash=activationCustomerType(row)===CUSTOMER_TYPE.CASH;return `<tr data-action="imei-360" data-imei="${row.imei}" style="cursor:pointer"><td class="mono cell-main">${row.imei}</td><td>${esc(p.brand)}</td><td>${esc(p.model)}</td><td><div class="cell-main">${esc(buyer||"—")} ${buyer?`<span class="badge ${cash?"badge-warning":""}" style="margin-left:5px">${cash?"Cash":"Party"}</span>`:""}</div><div class="cell-sub">${esc(mobile||"")}</div></td><td>${dateFmt(row.saleDate||latestSaleHistory(row)?.saleDate)}</td><td>${dateFmt(row.activation?.activationDate)}</td><td>${statusBadge(row.activation?.status||"NOT_ACTIVATED")}</td><td>${statusBadge(row.stockStatus)}</td></tr>`;}).join("")}</tbody></table></div><div class="pagination"><span>Showing ${rows.length?((state.activationPage-1)*PAGE_SIZE+1):0}–${Math.min(state.activationPage*PAGE_SIZE,rows.length)} of ${rows.length}</span><div class="inline-actions"><button class="btn btn-sm" data-action="activation-page" data-page="${state.activationPage-1}" ${state.activationPage<=1?"disabled":""}>Previous</button><span>Page ${state.activationPage} / ${pageCount}</span><button class="btn btn-sm" data-action="activation-page" data-page="${state.activationPage+1}" ${state.activationPage>=pageCount?"disabled":""}>Next</button></div></div>`:emptyState("No inventory","Activation data appears after stock is purchased.")}
+        ${pageRows.map(row=>{const p=productName(row,maps),buyer=activationParty(row),mobile=activationMobile(row),cash=activationCustomerType(row)===CUSTOMER_TYPE.CASH;return `<tr data-action="imei-360" data-imei="${attr(row.imei)}" style="cursor:pointer"><td class="mono cell-main">${esc(row.imei)}</td><td>${esc(p.brand)}</td><td>${esc(p.model)}</td><td><div class="cell-main">${esc(buyer||"—")} ${buyer?`<span class="badge ${cash?"badge-warning":""}" style="margin-left:5px">${cash?"Cash":"Party"}</span>`:""}</div><div class="cell-sub">${esc(mobile||"")}</div></td><td>${dateFmt(row.saleDate||latestSaleHistory(row)?.saleDate)}</td><td>${dateFmt(row.activation?.activationDate)}</td><td>${statusBadge(row.activation?.status||"NOT_ACTIVATED")}</td><td>${statusBadge(row.stockStatus)}</td></tr>`;}).join("")}</tbody></table></div><div class="pagination"><span>Showing ${rows.length?((state.activationPage-1)*PAGE_SIZE+1):0}–${Math.min(state.activationPage*PAGE_SIZE,rows.length)} of ${rows.length}</span><div class="inline-actions"><button class="btn btn-sm" data-action="activation-page" data-page="${state.activationPage-1}" ${state.activationPage<=1?"disabled":""}>Previous</button><span>Page ${state.activationPage} / ${pageCount}</span><button class="btn btn-sm" data-action="activation-page" data-page="${state.activationPage+1}" ${state.activationPage>=pageCount?"disabled":""}>Next</button></div></div>`:emptyState("No inventory","Activation data appears after stock is purchased.")}
       </section>`;
     };
     const renderUnmatchedActivation = db => `<section class="card">
       <div class="toolbar"><div><strong>Unknown activation IMEIs</strong><div class="cell-sub">These records did not create inventory.</div></div><div class="toolbar-spacer"></div><button class="btn btn-sm" data-action="export-unmatched">${icon("download")}CSV Export</button></div>
       ${db.unmatchedActivations.length?`<div class="table-wrap"><table><thead><tr><th>Serial / IMEI</th><th>Activation Date</th><th>Source File</th><th>Imported At</th><th>Reason</th></tr></thead><tbody>
-      ${db.unmatchedActivations.map(row=>`<tr><td class="mono cell-main">${esc(row.imei)}</td><td>${dateFmt(row.activationDate)}</td><td>${esc(row.sourceFile)}</td><td>${dateTimeFmt(row.importedAt)}</td><td>${esc(row.reason)}</td></tr>`).join("")}</tbody></table></div>`:emptyState("No unmatched IMEIs","Every imported activation record matched current inventory.","check")}
+      ${capRows(db.unmatchedActivations).map(row=>`<tr><td class="mono cell-main">${esc(row.imei)}</td><td>${dateFmt(row.activationDate)}</td><td>${esc(row.sourceFile)}</td><td>${dateTimeFmt(row.importedAt)}</td><td>${esc(row.reason)}</td></tr>`).join("")}</tbody></table></div>${capNote(db.unmatchedActivations,"unmatched IMEIs")}`:emptyState("No unmatched IMEIs","Every imported activation record matched current inventory.","check")}
     </section>`;
 
     // Sales and billing
@@ -4650,7 +4927,7 @@
         : [{id:"quick",label:"Quick Sale"},{id:"order",label:"Create Qty Order"},{id:"pending",label:"Pending Orders"},{id:"history",label:"Sales History"}];
       if (!allowedTabs.some(tab => tab.id === state.fulfillmentTab)) state.fulfillmentTab = "quick";
       if (!state.saleDraft.invoiceDate) state.saleDraft.invoiceDate = localDateISO();
-      if (!state.saleDraft.invoiceNumber && !isTallyParallelMode(db.settings)) state.saleDraft.invoiceNumber = nextDocumentPreview(db.sales, db.settings.invoicePrefix || "INV", "invoiceNumber");
+      if (!isTallyParallelMode(db.settings) && (!state.saleDraft.invoiceNumber || db.sales.some(row => lower(row.invoiceNumber) === lower(state.saleDraft.invoiceNumber)))) state.saleDraft.invoiceNumber = nextDocumentPreview(db.sales, db.settings.invoicePrefix || "INV", "invoiceNumber");
       let content = "";
       if (state.fulfillmentTab === "quick") content = renderSaleEntry(db);
       else if (state.fulfillmentTab === "order") content = renderSaleOrderEntry(db);
@@ -4816,7 +5093,7 @@
       </div><div id="sales-history-table">${salesHistoryTable(rows)}</div></section>`;
     };
     const salesHistoryTable=rows=>rows.length?`<div class="table-wrap"><table><thead><tr><th>Invoice / Tally Ref</th><th>Customer Type</th><th>Billing Source</th><th>Sale Type</th><th>Date</th><th>Customer / Buyer</th><th>Qty</th><th>Taxable</th><th>GST</th><th>Grand Total</th><th>Status</th><th>Actions</th></tr></thead><tbody>
-      ${rows.map(row=>{const cash=customerTypeOf(row)===CUSTOMER_TYPE.CASH;return `<tr><td class="cell-main">${esc(row.invoiceNumber)}</td><td><span class="badge ${cash?"badge-warning":""}">${cash?"Direct / Cash":"Registered Party"}</span></td><td><span class="badge ${saleUsesTally(row)?"badge-info":""}">${saleModeLabel(row)}</span></td><td><span class="badge ${row.saleType&&row.saleType!==SALE_TYPE.NORMAL?"badge-warning":""}">${esc(saleTypeLabel(row.saleType))}</span>${row.priceOverrideReason?`<div class="cell-sub">${esc(row.priceOverrideReason)}</div>`:""}</td><td>${dateFmt(row.invoiceDate)}</td><td><div class="cell-main">${esc(row.customerName)}</div><div class="cell-sub">${esc(row.customerMobile||"")}${cash&&row.customerSnapshot?.address?" · "+esc(row.customerSnapshot.address):""}</div></td><td>${row.totalQty||saleItemsQty(row.items)}</td><td class="money">${money(row.taxableValue)}</td><td class="money">${money(row.gstAmount)}</td><td class="money cell-main">${money(row.grandTotal)}</td><td>${statusBadge(row.status)}</td><td><div class="inline-actions"><button class="btn btn-sm" data-action="view-sale" data-id="${row.id}">View</button><button class="btn btn-sm" data-action="print-sale" data-id="${row.id}">${saleUsesTally(row)?"Print Copy":"Print"}</button>${row.status===ACTIVE_SALE?`<button class="btn btn-sm btn-danger-soft" data-action="cancel-sale" data-id="${row.id}">Void</button>`:""}</div></td></tr>`;}).join("")}</tbody></table></div>`:emptyState("No sales records","Create a registered-party or direct cash sale to see its history.","sales");
+      ${capRows(rows).map(row=>{const cash=customerTypeOf(row)===CUSTOMER_TYPE.CASH;return `<tr><td class="cell-main">${esc(row.invoiceNumber)}</td><td><span class="badge ${cash?"badge-warning":""}">${cash?"Direct / Cash":"Registered Party"}</span></td><td><span class="badge ${saleUsesTally(row)?"badge-info":""}">${saleModeLabel(row)}</span></td><td><span class="badge ${row.saleType&&row.saleType!==SALE_TYPE.NORMAL?"badge-warning":""}">${esc(saleTypeLabel(row.saleType))}</span>${row.priceOverrideReason?`<div class="cell-sub">${esc(row.priceOverrideReason)}</div>`:""}</td><td>${dateFmt(row.invoiceDate)}</td><td><div class="cell-main">${esc(row.customerName)}</div><div class="cell-sub">${esc(row.customerMobile||"")}${cash&&row.customerSnapshot?.address?" · "+esc(row.customerSnapshot.address):""}</div></td><td>${row.totalQty||saleItemsQty(row.items)}</td><td class="money">${money(row.taxableValue)}</td><td class="money">${money(row.gstAmount)}</td><td class="money cell-main">${money(row.grandTotal)}</td><td>${statusBadge(row.status)}</td><td><div class="inline-actions"><button class="btn btn-sm" data-action="view-sale" data-id="${row.id}">View</button><button class="btn btn-sm" data-action="print-sale" data-id="${row.id}">${saleUsesTally(row)?"Print Copy":"Print"}</button>${row.status===ACTIVE_SALE?`<button class="btn btn-sm btn-danger-soft" data-action="cancel-sale" data-id="${row.id}">Void</button>`:""}</div></td></tr>`;}).join("")}</tbody></table></div>${capNote(rows,"invoices")}`:emptyState("No sales records","Create a registered-party or direct cash sale to see its history.","sales");
 
     // Returns
     const renderReturns = async db => {
@@ -4859,7 +5136,7 @@
               </div>
               <div class="scan-footer"><div class="scan-feedback"><span class="scan-feedback-dot"></span><span>Enter or button performs the same lifecycle check</span></div><div class="scan-rule-chips"><span class="scan-chip">Original invoice</span><span class="scan-chip">Product auto-detect</span></div></div>
             </div>
-            ${validLookup?`<div class="selected-party" style="margin-top:15px"><div><h3 class="mono">${lookup.inventory.imei}</h3><p>${esc(lookup.product)} · Current status: ${statusLabel(lookup.inventory.stockStatus)}</p></div><button class="btn btn-sm" data-action="clear-return-lookup">Change</button></div>`:""}
+            ${validLookup?`<div class="selected-party" style="margin-top:15px"><div><h3 class="mono">${esc(lookup.inventory.imei)}</h3><p>${esc(lookup.product)} · Current status: ${statusLabel(lookup.inventory.stockStatus)}</p></div><button class="btn btn-sm" data-action="clear-return-lookup">Change</button></div>`:""}
           </div>
         </section>
         <section class="card">
@@ -4873,7 +5150,7 @@
           </div></div>`:emptyState("No IMEI selected","Scan an IMEI to show its original transaction.","search")}
         </section>
         ${validLookup?`<section class="card span-2"><div class="card-head"><h3>3. Confirm ${isSales?"sales":"purchase"} return</h3></div><div class="card-body">
-          <form id="return-form"><input type="hidden" name="type" value="${isSales?"SALES_RETURN":"PURCHASE_RETURN"}"><input type="hidden" name="imei" value="${lookup.inventory.imei}">
+          <form id="return-form"><input type="hidden" name="type" value="${isSales?"SALES_RETURN":"PURCHASE_RETURN"}"><input type="hidden" name="imei" value="${attr(lookup.inventory.imei)}">
             <div class="grid grid-3">
               <div class="field"><label>Return Date <span class="required">*</span></label><input class="input" type="date" name="returnDate" value="${localDateISO()}" required></div>
               ${isSales?`<div class="field"><label>Return Outcome <span class="required">*</span></label><select class="select" name="outcome"><option value="IN_STOCK">Return to Stock</option><option value="DAMAGED">Damaged</option></select></div>`:isWarehouseRole()?`<div class="field"><label>Return Processing</label><input class="input" value="Price controlled by Back Office" readonly></div>`:`<div class="field"><label>Return Value</label><input class="input" value="${money(lookup.value)}" readonly></div>`}
@@ -4887,7 +5164,7 @@
     };
     const renderReturnHistory=db=>`<section class="card"><div class="toolbar"><strong>${db.returns.length} return records</strong><div class="toolbar-spacer"></div>${isWarehouseRole()?"":`<button class="btn btn-sm" data-action="export-returns">${icon("download")}CSV Export</button>`}</div>
       ${db.returns.length?`<div class="table-wrap"><table><thead><tr><th>Return ID</th><th>Date</th><th>Type</th><th>Product / Identifier</th><th>Tracking</th><th>Qty</th><th>Party / Buyer</th><th>Original Invoice</th>${isWarehouseRole()?"":"<th>Value</th>"}<th>Outcome</th><th>Reason</th></tr></thead><tbody>
-      ${db.returns.map(row=>{const cash=row.type==="SALES_RETURN"&&row.customerType===CUSTOMER_TYPE.CASH;return `<tr><td class="cell-main">${esc(row.id)}</td><td>${dateFmt(row.returnDate)}</td><td>${row.type==="SALES_RETURN"?'<span class="badge badge-info">Sales Return</span>':'<span class="badge badge-warning">Purchase Return</span>'}</td><td ${row.imei&&!isWarehouseRole()?`data-action="imei-360" data-imei="${attr(row.imei)}" style="cursor:pointer"`:""}><div class="cell-main">${esc(row.productName||row.imei||"—")}</div>${row.imei?`<div class="mono cell-sub">${esc(row.imei)}</div>`:""}</td><td><span class="badge ${row.trackingMode===TRACKING_MODE.QUANTITY?"badge-info":""}">${row.trackingMode===TRACKING_MODE.QUANTITY?"Quantity Only":"Serial / IMEI"}</span></td><td><strong>${Number(row.quantity||1)}</strong></td><td><div class="cell-main">${esc(row.partyName)}</div><div class="cell-sub">${cash?"Direct / Cash · ":""}${esc(row.customerMobile||"")}</div></td><td>${esc(row.originalInvoice)}</td>${isWarehouseRole()?"":`<td class="money">${money(row.value)}</td>`}<td>${statusBadge(row.outcome)}</td><td>${esc(row.reason)}</td></tr>`;}).join("")}</tbody></table></div>`:emptyState("No returns","Completed returns will appear here.","returns")}
+      ${capRows([...db.returns].sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)))).map(row=>{const cash=row.type==="SALES_RETURN"&&row.customerType===CUSTOMER_TYPE.CASH;return `<tr><td class="cell-main">${esc(row.id)}</td><td>${dateFmt(row.returnDate)}</td><td>${row.type==="SALES_RETURN"?'<span class="badge badge-info">Sales Return</span>':'<span class="badge badge-warning">Purchase Return</span>'}</td><td ${row.imei&&!isWarehouseRole()?`data-action="imei-360" data-imei="${attr(row.imei)}" style="cursor:pointer"`:""}><div class="cell-main">${esc(row.productName||row.imei||"—")}</div>${row.imei?`<div class="mono cell-sub">${esc(row.imei)}</div>`:""}</td><td><span class="badge ${row.trackingMode===TRACKING_MODE.QUANTITY?"badge-info":""}">${row.trackingMode===TRACKING_MODE.QUANTITY?"Quantity Only":"Serial / IMEI"}</span></td><td><strong>${Number(row.quantity||1)}</strong></td><td><div class="cell-main">${esc(row.partyName)}</div><div class="cell-sub">${cash?"Direct / Cash · ":""}${esc(row.customerMobile||"")}</div></td><td>${esc(row.originalInvoice)}</td>${isWarehouseRole()?"":`<td class="money">${money(row.value)}</td>`}<td>${statusBadge(row.outcome)}</td><td>${esc(row.reason)}</td></tr>`;}).join("")}</tbody></table></div>${capNote(db.returns,"returns")}`:emptyState("No returns","Completed returns will appear here.","returns")}
     </section>`;
 
     // Expenses
@@ -4909,7 +5186,7 @@
           <section class="card span-2"><div class="card-head"><div><h3>Expense history</h3><div class="cell-sub">${dateFmt(range.from)} – ${dateFmt(range.to)}</div></div><strong class="negative">${money(sum(rows,row=>row.amount))}</strong></div>
             ${state.expenseRange==="custom"?`<div class="toolbar"><div class="field"><label>From</label><input class="input" type="date" id="expense-from" value="${attr(range.from)}"></div><div class="field"><label>To</label><input class="input" type="date" id="expense-to" value="${attr(range.to)}"></div></div>`:""}
             ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Expense Head</th><th>Amount</th><th>Reference</th><th>Remarks</th><th></th></tr></thead><tbody>
-            ${rows.map(row=>`<tr><td>${dateFmt(row.date)}</td><td class="cell-main">${esc(row.expenseHead)}</td><td class="money negative">${money(row.amount)}</td><td>${esc(row.reference||"—")}</td><td>${esc(row.remarks||"—")}</td><td><button class="btn btn-sm" data-action="edit-expense" data-id="${row.id}">Edit</button></td></tr>`).join("")}</tbody></table></div>`:emptyState("No expenses in this period","Add an expense using the simple form.","expenses")}
+            ${capRows(rows).map(row=>`<tr><td>${dateFmt(row.date)}</td><td class="cell-main">${esc(row.expenseHead)}</td><td class="money negative">${money(row.amount)}</td><td>${esc(row.reference||"—")}</td><td>${esc(row.remarks||"—")}</td><td><button class="btn btn-sm" data-action="edit-expense" data-id="${row.id}">Edit</button></td></tr>`).join("")}</tbody></table></div>${capNote(rows,"expenses")}`:emptyState("No expenses in this period","Add an expense using the simple form.","expenses")}
           </section>
         </div>
       </div>`;
@@ -4943,7 +5220,7 @@
           </form></div></section>
           <section class="card span-2"><div class="card-head"><div><h3>CN / DN history</h3><div class="cell-sub">${dateFmt(range.from)} – ${dateFmt(range.to)}</div></div><div style="text-align:right"><span class="cell-sub">Net P&amp;L adjustment</span><strong class="${adjustment<0?"negative":"positive"}" style="display:block">${adjustment<0?"− ":"+ "}${money(Math.abs(adjustment))}</strong></div></div>
             <div class="toolbar"><span class="badge">${rows.length} entries</span><div class="toolbar-spacer"></div><button class="btn btn-sm" data-action="export-cndn">${icon("download")}CSV Export</button></div>
-            ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Type</th><th>Number</th><th>Party</th><th>Ledger</th><th>Effect</th><th>Amount</th><th>Reference</th><th>Remarks</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${dateFmt(row.date)}</td><td><span class="badge ${row.type==="CN"?"badge-info":"badge-warning"}">${row.type}</span></td><td class="cell-main">${esc(row.noteNumber)}</td><td>${esc(row.partyName)}</td><td>${esc(ledgerSideLabel(row.ledgerSide))}</td><td><span class="${row.effect==="INCREASE"?"positive":"negative"}">${row.effect==="INCREASE"?"Increase":"Reduce"}</span></td><td class="money ${row.effect==="INCREASE"?"positive":"negative"}">${money(row.amount)}</td><td>${esc(row.reference||"—")}</td><td>${esc(row.remarks||"—")}</td></tr>`).join("")}</tbody></table></div>`:emptyState("No CN / DN entries","Add the first note using the simple form.","note")}
+            ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Type</th><th>Number</th><th>Party</th><th>Ledger</th><th>Effect</th><th>Amount</th><th>Reference</th><th>Remarks</th></tr></thead><tbody>${capRows(rows).map(row=>`<tr><td>${dateFmt(row.date)}</td><td><span class="badge ${row.type==="CN"?"badge-info":"badge-warning"}">${row.type}</span></td><td class="cell-main">${esc(row.noteNumber)}</td><td>${esc(row.partyName)}</td><td>${esc(ledgerSideLabel(row.ledgerSide))}</td><td><span class="${row.effect==="INCREASE"?"positive":"negative"}">${row.effect==="INCREASE"?"Increase":"Reduce"}</span></td><td class="money ${row.effect==="INCREASE"?"positive":"negative"}">${money(row.amount)}</td><td>${esc(row.reference||"—")}</td><td>${esc(row.remarks||"—")}</td></tr>`).join("")}</tbody></table></div>${capNote(rows,"notes")}`:emptyState("No CN / DN entries","Add the first note using the simple form.","note")}
           </section>
         </div>
       </div>`;
@@ -4976,7 +5253,7 @@
     const renderMoneyHistory = db => {
       const rows=getFilteredMoneyTransactions(db),f=state.moneyFilters;
       return `<section class="card"><div class="toolbar"><div class="field" style="flex:1;min-width:220px"><label>Search</label><div class="input-icon"><span data-icon="search"></span><input class="input" id="money-search" value="${attr(state.moneySearch)}" placeholder="Voucher, party, reference or remarks"></div></div><div class="field"><label>From</label><input class="input" type="date" data-money-filter="from" value="${attr(f.from)}"></div><div class="field"><label>To</label><input class="input" type="date" data-money-filter="to" value="${attr(f.to)}"></div><div class="field"><label>Type</label><select class="select" data-money-filter="type"><option value="">All</option><option value="COLLECTION" ${f.type===MONEY_TX_TYPE.COLLECTION?"selected":""}>Collection</option><option value="PAYMENT" ${f.type===MONEY_TX_TYPE.PAYMENT?"selected":""}>Payment</option></select></div><div class="field"><label>Party</label><select class="select" data-money-filter="partyId">${options(db.parties,f.partyId,row=>row.name,"All parties")}</select></div><div class="field"><label>Status</label><select class="select" data-money-filter="status"><option value="">All</option><option value="POSTED" ${f.status===MONEY_STATUS.POSTED?"selected":""}>Posted</option><option value="VOIDED" ${f.status===MONEY_STATUS.VOIDED?"selected":""}>Voided</option></select></div><button class="btn btn-sm" style="align-self:flex-end" data-action="export-money">${icon("download")}CSV Export</button></div>
-        ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Voucher</th><th>Type</th><th>Party</th><th>Mode</th><th>Reference</th><th>Amount</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${dateFmt(row.date)}</td><td class="cell-main">${esc(row.voucherNumber)}</td><td><span class="badge ${row.type===MONEY_TX_TYPE.COLLECTION?"badge-success":"badge-warning"}">${row.type===MONEY_TX_TYPE.COLLECTION?"Collection":"Payment"}</span></td><td><div class="cell-main">${esc(row.partyName)}</div><div class="cell-sub">${esc(row.partySnapshot?.code||"")}</div></td><td>${esc(paymentModeLabel(row.mode))}</td><td>${esc(row.reference||"—")}</td><td class="money ${row.type===MONEY_TX_TYPE.COLLECTION?"positive":""}">${money(row.amount)}</td><td>${statusBadge(row.status)}</td><td><div class="inline-actions"><button class="btn btn-sm" data-action="view-money" data-id="${row.id}">View</button><button class="btn btn-sm" data-action="open-ledger" data-id="${row.partyId}" data-side="${row.type===MONEY_TX_TYPE.COLLECTION?LEDGER_SIDE.CUSTOMER:LEDGER_SIDE.SUPPLIER}">Ledger</button>${row.status===MONEY_STATUS.POSTED?`<button class="btn btn-sm btn-danger-soft" data-action="void-money" data-id="${row.id}">Void</button>`:""}</div></td></tr>`).join("")}</tbody></table></div>`:emptyState("No collection or payment vouchers","Post a customer collection or supplier payment to start the ledger history.","collection")}</section>`;
+        ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Voucher</th><th>Type</th><th>Party</th><th>Mode</th><th>Reference</th><th>Amount</th><th>Status</th><th>Actions</th></tr></thead><tbody>${capRows(rows).map(row=>`<tr><td>${dateFmt(row.date)}</td><td class="cell-main">${esc(row.voucherNumber)}</td><td><span class="badge ${row.type===MONEY_TX_TYPE.COLLECTION?"badge-success":"badge-warning"}">${row.type===MONEY_TX_TYPE.COLLECTION?"Collection":"Payment"}</span></td><td><div class="cell-main">${esc(row.partyName)}</div><div class="cell-sub">${esc(row.partySnapshot?.code||"")}</div></td><td>${esc(paymentModeLabel(row.mode))}</td><td>${esc(row.reference||"—")}</td><td class="money ${row.type===MONEY_TX_TYPE.COLLECTION?"positive":""}">${money(row.amount)}</td><td>${statusBadge(row.status)}</td><td><div class="inline-actions"><button class="btn btn-sm" data-action="view-money" data-id="${row.id}">View</button><button class="btn btn-sm" data-action="open-ledger" data-id="${row.partyId}" data-side="${row.type===MONEY_TX_TYPE.COLLECTION?LEDGER_SIDE.CUSTOMER:LEDGER_SIDE.SUPPLIER}">Ledger</button>${row.status===MONEY_STATUS.POSTED?`<button class="btn btn-sm btn-danger-soft" data-action="void-money" data-id="${row.id}">Void</button>`:""}</div></td></tr>`).join("")}</tbody></table></div>${capNote(rows,"vouchers")}`:emptyState("No collection or payment vouchers","Post a customer collection or supplier payment to start the ledger history.","collection")}</section>`;
     };
     const renderMoney = async db => {
       const tabBar=tabs([{id:"collection",label:"New Collection"},{id:"payment",label:"New Payment"},{id:"history",label:"Voucher History"}],state.moneyTab,"money-tab");
@@ -4995,7 +5272,7 @@
         <div class="kpi-grid">${kpiCard("Total Receivable",money(receivable),"Customer / dealer due","negative")}${kpiCard("Total Payable",money(payable),"Supplier due","negative")}${kpiCard("Customer Advance",money(customerAdvance),"Credit balance with customers","positive")}${kpiCard("Supplier Advance",money(supplierAdvance),"Advance paid to suppliers","positive")}${kpiCard("Net Position",money(receivable-payable),receivable>=payable?"Net receivable":"Net payable",receivable>=payable?"positive":"negative")}</div>
         <div class="callout" style="margin-bottom:16px"><strong>Actual balance rule:</strong> invoice value includes GST; posted returns, CN/DN and collection/payment vouchers are adjusted up to the selected date. Direct / Cash Sale invoices are treated as settled and excluded from party outstanding.</div>
         <section class="card"><div class="toolbar"><div class="field" style="flex:1;min-width:230px"><label>Search Party</label><div class="input-icon"><span data-icon="search"></span><input class="input" id="outstanding-search" value="${attr(state.outstandingSearch)}" placeholder="Party name, code, mobile or area"></div></div><div class="field"><label>As On</label><input class="input" type="date" id="outstanding-as-of" value="${attr(asOf)}"></div><div class="field"><label>View</label><select class="select" id="outstanding-type"><option value="DUE" ${state.outstandingType==="DUE"?"selected":""}>Current Due</option><option value="RECEIVABLE" ${state.outstandingType==="RECEIVABLE"?"selected":""}>Receivable Only</option><option value="PAYABLE" ${state.outstandingType==="PAYABLE"?"selected":""}>Payable Only</option><option value="ADVANCE" ${state.outstandingType==="ADVANCE"?"selected":""}>Advance Balances</option><option value="ALL" ${state.outstandingType==="ALL"?"selected":""}>All With Activity</option></select></div></div>
-          ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Party / Ledger</th><th>Sales / Opening</th><th>Sales Return / CN</th><th>Collection</th><th>Receivable</th><th>Purchase / Opening</th><th>Purchase Return / CN</th><th>Payment</th><th>Payable</th><th>Position</th><th>Actions</th></tr></thead><tbody>${rows.map(row=>`<tr><td><div class="cell-main">${esc(row.partyName)}</div><div class="cell-sub">${esc(row.partyCode)} · ${esc(statusLabel(row.partyType))} · ${esc(row.mobile||"No mobile")}</div></td><td><div class="money">${money(row.customerOpening+row.salesBilled+row.customerDN)}</div><div class="cell-sub">Bills ${money(row.salesBilled)} · Opening ${money(row.customerOpening)} · DN ${money(row.customerDN)}</div></td><td><div class="money">${money(row.salesReturns+row.customerCN)}</div><div class="cell-sub">Return ${money(row.salesReturns)} · CN ${money(row.customerCN)}</div></td><td class="money positive">${money(row.collections)}</td><td class="money ${row.receivable>0?"negative":"positive"}"><strong>${ledgerBalanceText(row.receivable,LEDGER_SIDE.CUSTOMER)}</strong></td><td><div class="money">${money(row.supplierOpening+row.purchasesBilled+row.supplierDN)}</div><div class="cell-sub">Bills ${money(row.purchasesBilled)} · Opening ${money(row.supplierOpening)} · DN ${money(row.supplierDN)}</div></td><td><div class="money">${money(row.purchaseReturns+row.supplierCN)}</div><div class="cell-sub">Return ${money(row.purchaseReturns)} · CN ${money(row.supplierCN)}</div></td><td class="money">${money(row.paymentsMade)}</td><td class="money ${row.payable>0?"negative":"positive"}"><strong>${ledgerBalanceText(row.payable,LEDGER_SIDE.SUPPLIER)}</strong></td><td><div class="cell-main">${esc(partyPositionText(row))}</div><div class="cell-sub">Net ${row.netPosition>=0?"Receivable":"Payable"} ${money(Math.abs(row.netPosition))}</div></td><td><div class="inline-actions"><button class="btn btn-sm" data-action="open-ledger" data-id="${row.partyId}">Ledger</button>${["CUSTOMER","BOTH"].includes(row.partyType)?`<button class="btn btn-sm" data-action="open-collection" data-id="${row.partyId}">Collect</button>`:""}${["SUPPLIER","BOTH"].includes(row.partyType)?`<button class="btn btn-sm" data-action="open-payment" data-id="${row.partyId}">Pay</button>`:""}</div></td></tr>`).join("")}</tbody></table></div>`:emptyState("No matching outstanding","Change the view or search, or post bills and collection/payment vouchers.","outstanding")}
+          ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Party / Ledger</th><th>Sales / Opening</th><th>Sales Return / CN</th><th>Collection</th><th>Receivable</th><th>Purchase / Opening</th><th>Purchase Return / CN</th><th>Payment</th><th>Payable</th><th>Position</th><th>Actions</th></tr></thead><tbody>${capRows(rows).map(row=>`<tr><td><div class="cell-main">${esc(row.partyName)}</div><div class="cell-sub">${esc(row.partyCode)} · ${esc(statusLabel(row.partyType))} · ${esc(row.mobile||"No mobile")}</div></td><td><div class="money">${money(row.customerOpening+row.salesBilled+row.customerDN)}</div><div class="cell-sub">Bills ${money(row.salesBilled)} · Opening ${money(row.customerOpening)} · DN ${money(row.customerDN)}</div></td><td><div class="money">${money(row.salesReturns+row.customerCN)}</div><div class="cell-sub">Return ${money(row.salesReturns)} · CN ${money(row.customerCN)}</div></td><td class="money positive">${money(row.collections)}</td><td class="money ${row.receivable>0?"negative":"positive"}"><strong>${ledgerBalanceText(row.receivable,LEDGER_SIDE.CUSTOMER)}</strong></td><td><div class="money">${money(row.supplierOpening+row.purchasesBilled+row.supplierDN)}</div><div class="cell-sub">Bills ${money(row.purchasesBilled)} · Opening ${money(row.supplierOpening)} · DN ${money(row.supplierDN)}</div></td><td><div class="money">${money(row.purchaseReturns+row.supplierCN)}</div><div class="cell-sub">Return ${money(row.purchaseReturns)} · CN ${money(row.supplierCN)}</div></td><td class="money">${money(row.paymentsMade)}</td><td class="money ${row.payable>0?"negative":"positive"}"><strong>${ledgerBalanceText(row.payable,LEDGER_SIDE.SUPPLIER)}</strong></td><td><div class="cell-main">${esc(partyPositionText(row))}</div><div class="cell-sub">Net ${row.netPosition>=0?"Receivable":"Payable"} ${money(Math.abs(row.netPosition))}</div></td><td><div class="inline-actions"><button class="btn btn-sm" data-action="open-ledger" data-id="${row.partyId}">Ledger</button>${["CUSTOMER","BOTH"].includes(row.partyType)?`<button class="btn btn-sm" data-action="open-collection" data-id="${row.partyId}">Collect</button>`:""}${["SUPPLIER","BOTH"].includes(row.partyType)?`<button class="btn btn-sm" data-action="open-payment" data-id="${row.partyId}">Pay</button>`:""}</div></td></tr>`).join("")}</tbody></table></div>${capNote(rows,"parties")}`:emptyState("No matching outstanding","Change the view or search, or post bills and collection/payment vouchers.","outstanding")}
         </section></div>`;
     };
 
@@ -5018,7 +5295,7 @@
         ${party.type==="BOTH"?`<div class="segmented" style="margin-bottom:16px"><button class="${side===LEDGER_SIDE.CUSTOMER?"active":""}" data-action="ledger-side" data-side="CUSTOMER">Customer Receivable Ledger</button><button class="${side===LEDGER_SIDE.SUPPLIER?"active":""}" data-action="ledger-side" data-side="SUPPLIER">Supplier Payable Ledger</button></div>`:""}
         <div class="kpi-grid">${kpiCard("Current Receivable",ledgerBalanceText(account?.receivable||0,LEDGER_SIDE.CUSTOMER),"Sales − returns − collection ± CN/DN",account?.receivable>0?"negative":"positive")}${kpiCard("Current Payable",ledgerBalanceText(account?.payable||0,LEDGER_SIDE.SUPPLIER),"Purchase − returns − payment ± CN/DN",account?.payable>0?"negative":"positive")}${kpiCard("Period Opening",ledgerBalanceText(ledger.opening,side),ledgerSideLabel(side))}${kpiCard("Period Debit",money(ledger.totalDebit),"Selected date range")}${kpiCard("Period Credit",money(ledger.totalCredit),"Selected date range")}${kpiCard("Closing Balance",ledgerBalanceText(ledger.closing,side),ledger.closing>=0?"Amount due":"Advance balance",ledger.closing>0?"negative":"positive")}</div>
         <section class="card"><div class="toolbar"><div class="field" style="flex:1;min-width:220px"><label>Search Ledger</label><div class="input-icon"><span data-icon="search"></span><input class="input" id="ledger-search" value="${attr(state.ledgerSearch)}" placeholder="Particulars, voucher or reference"></div></div><div class="field"><label>From</label><input class="input" type="date" id="ledger-from" value="${attr(state.ledgerFrom)}"></div><div class="field"><label>To</label><input class="input" type="date" id="ledger-to" value="${attr(effectiveTo)}"></div><span class="badge badge-info" style="align-self:flex-end">${esc(ledgerSideLabel(side))}</span></div>
-          <div class="table-wrap"><table><thead><tr><th>Date</th><th>Particulars</th><th>Voucher</th><th>Reference / Narration</th><th>Debit</th><th>Credit</th><th>Running Balance</th><th>Action</th></tr></thead><tbody><tr><td>${state.ledgerFrom?dateFmt(state.ledgerFrom):"—"}</td><td class="cell-main">Opening Balance</td><td>—</td><td>Balance brought forward</td><td>—</td><td>—</td><td class="money"><strong>${ledgerBalanceText(ledger.opening,side)}</strong></td><td></td></tr>${rows.map(row=>`<tr><td>${dateFmt(row.date)}</td><td><div class="cell-main">${esc(row.particulars)}</div><div class="cell-sub">${esc(statusLabel(row.kind))}</div></td><td class="cell-main">${esc(row.voucher)}</td><td>${esc(row.reference||"—")}</td><td class="money">${row.debit?money(row.debit):"—"}</td><td class="money">${row.credit?money(row.credit):"—"}</td><td class="money ${row.balance>0?"negative":"positive"}"><strong>${ledgerBalanceText(row.balance,side)}</strong></td><td><button class="btn btn-sm" data-action="view-ledger-source" data-kind="${row.kind}" data-id="${row.sourceId}">View</button></td></tr>`).join("")}<tr><th colspan="4">Period Total / Closing</th><th class="money">${money(ledger.totalDebit)}</th><th class="money">${money(ledger.totalCredit)}</th><th class="money">${ledgerBalanceText(ledger.closing,side)}</th><th></th></tr></tbody></table></div>${!rows.length?`<div class="callout" style="margin:14px">No ledger transactions match this date range or search. Opening balance is still shown.</div>`:""}</section></div>`;
+          ${rows.length>LIST_LIMIT?`<div class="pagination"><span>Showing the most recent ${LIST_LIMIT} of ${number(rows.length)} entries. Narrow the date range, or export the full ledger to CSV.</span></div>`:""}<div class="table-wrap"><table><thead><tr><th>Date</th><th>Particulars</th><th>Voucher</th><th>Reference / Narration</th><th>Debit</th><th>Credit</th><th>Running Balance</th><th>Action</th></tr></thead><tbody><tr><td>${state.ledgerFrom?dateFmt(state.ledgerFrom):"—"}</td><td class="cell-main">Opening Balance</td><td>—</td><td>Balance brought forward</td><td>—</td><td>—</td><td class="money"><strong>${ledgerBalanceText(ledger.opening,side)}</strong></td><td></td></tr>${(rows.length>LIST_LIMIT?rows.slice(-LIST_LIMIT):rows).map(row=>`<tr><td>${dateFmt(row.date)}</td><td><div class="cell-main">${esc(row.particulars)}</div><div class="cell-sub">${esc(statusLabel(row.kind))}</div></td><td class="cell-main">${esc(row.voucher)}</td><td>${esc(row.reference||"—")}</td><td class="money">${row.debit?money(row.debit):"—"}</td><td class="money">${row.credit?money(row.credit):"—"}</td><td class="money ${row.balance>0?"negative":"positive"}"><strong>${ledgerBalanceText(row.balance,side)}</strong></td><td><button class="btn btn-sm" data-action="view-ledger-source" data-kind="${row.kind}" data-id="${row.sourceId}">View</button></td></tr>`).join("")}<tr><th colspan="4">Period Total / Closing</th><th class="money">${money(ledger.totalDebit)}</th><th class="money">${money(ledger.totalCredit)}</th><th class="money">${ledgerBalanceText(ledger.closing,side)}</th><th></th></tr></tbody></table></div>${!rows.length?`<div class="callout" style="margin:14px">No ledger transactions match this date range or search. Opening balance is still shown.</div>`:""}</section></div>`;
     };
 
     // Reports
@@ -5188,7 +5465,7 @@
     const showProductPriceLog=async id=>{
       const db=await dataService.getDatabase(),model=db.models.find(row=>row.id===id);
       if(!model){toast("Product not found","error");return;}
-      const logs=db.priceLogs.filter(row=>row.modelId===id).sort((a,b)=>String(b.changedAt).localeCompare(String(a.changedAt)));
+      const logs=(await dataService.getPriceLogs(id)).sort((a,b)=>String(b.changedAt).localeCompare(String(a.changedAt)));
       const rows=logs.length?`<div class="table-wrap"><table><thead><tr><th>Changed At</th><th>Purchase Price</th><th>Sale Price</th><th>MRP</th><th>GST</th><th>Changed By</th><th>Reason</th></tr></thead><tbody>${logs.map(row=>`<tr><td>${dateTimeFmt(row.changedAt)}</td><td>${row.oldPrices?money(row.oldPrices.purchaseRate)+" → ":"Opening · "}<strong>${money(row.newPrices.purchaseRate)}</strong></td><td>${row.oldPrices?money(row.oldPrices.saleRate)+" → ":"Opening · "}<strong>${money(row.newPrices.saleRate)}</strong></td><td>${row.oldPrices?money(row.oldPrices.mrp)+" → ":"Opening · "}<strong>${money(row.newPrices.mrp)}</strong></td><td>${row.oldPrices?number(row.oldPrices.gst)+"% → ":"Opening · "}<strong>${number(row.newPrices.gst)}%</strong></td><td>${esc(row.changedBy)}</td><td>${esc(row.reason||"—")}</td></tr>`).join("")}</tbody></table></div>`:emptyState("No price changes","This product has no recorded price changes yet.","history");
       showModal({title:"Price history",subtitle:productMasterName(model),body:rows,size:"modal-lg",footer:`<button class="btn btn-primary" data-action="close-modal">Close</button>`});
     };
@@ -5216,8 +5493,8 @@
     const fieldOrderList=(db,rows)=>{
       const maps=getMaps(db);
       if(!rows.length)return emptyState("No matching orders","Submitted orders will appear here.","sales");
-      if(isFieldRole())return `<div class="mobile-list">${rows.map(order=>`<article class="mobile-list-card"><div class="card-head" style="padding:0 0 10px"><div><h3>${esc(order.orderNumber)}</h3><div class="cell-sub">${dateFmt(order.orderDate)} · ${esc(order.partyName)}</div></div>${workflowStatus(order.status)}</div><div class="hierarchy-line">${esc(order.salesmanName)} → ${esc(order.salesHeadName)}</div><div style="margin:10px 0">${order.items.map(line=>`<div style="display:flex;justify-content:space-between;gap:10px;padding:5px 0"><span>${esc(line.brandName+" · "+line.productName)}</span><strong>${number(line.quantity)}</strong></div>`).join("")}</div><div class="stats-strip" style="margin:0"><div class="mini-stat"><span>Units</span><strong>${number(order.totalQty)}</strong></div><div class="mini-stat"><span>Value</span><strong>${money(order.grandTotal)}</strong></div></div>${order.reviewReason?`<div class="callout ${order.status==="REJECTED"?"callout-warning":""}" style="margin-top:10px">${esc(order.reviewReason)}</div>`:""}${currentRole===ROLES.SALES_HEAD&&order.status==="SUBMITTED"?`<div class="inline-actions" style="margin-top:12px"><button class="btn btn-primary" data-action="approve-field-order" data-id="${order.id}">${icon("check")}Approve</button><button class="btn btn-danger-soft" data-action="reject-field-order" data-id="${order.id}">Reject</button></div>`:""}</article>`).join("")}</div>`;
-      return `<div class="table-wrap"><table><thead><tr><th>Order</th><th>Party</th><th>Hierarchy</th><th>Products</th><th>Qty</th><th>Value</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows.map(order=>`<tr><td><div class="cell-main">${esc(order.orderNumber)}</div><div class="cell-sub">${dateFmt(order.orderDate)}</div></td><td><div class="cell-main">${esc(order.partyName)}</div><div class="cell-sub">${esc(order.partyCode||"")}</div></td><td><div>${esc(order.salesmanName)}</div><div class="cell-sub">Head: ${esc(order.salesHeadName)}</div></td><td>${order.items.map(line=>`<div style="padding:3px 0">${esc(line.brandName+" · "+line.productName)} <strong>× ${number(line.quantity)}</strong></div>`).join("")}</td><td><strong>${number(order.totalQty)}</strong></td><td class="money"><strong>${money(order.grandTotal)}</strong></td><td>${workflowStatus(order.status)}${order.billingOrderNo?`<div class="cell-sub">${esc(order.billingOrderNo)}</div>`:""}</td><td>${isBackOfficeRole()&&order.status==="APPROVED"?`<button class="btn btn-sm btn-primary" data-action="send-field-order-billing" data-id="${order.id}">Send to Billing</button>`:order.status==="BILLING_PENDING"?`<button class="btn btn-sm" data-action="open-billing-order">Open Sales Desk</button>`:"—"}</td></tr>`).join("")}</tbody></table></div>`;
+      if(isFieldRole())return `<div class="mobile-list">${capRows(rows).map(order=>`<article class="mobile-list-card"><div class="card-head" style="padding:0 0 10px"><div><h3>${esc(order.orderNumber)}</h3><div class="cell-sub">${dateFmt(order.orderDate)} · ${esc(order.partyName)}</div></div>${workflowStatus(order.status)}</div><div class="hierarchy-line">${esc(order.salesmanName)} → ${esc(order.salesHeadName)}</div><div style="margin:10px 0">${order.items.map(line=>`<div style="display:flex;justify-content:space-between;gap:10px;padding:5px 0"><span>${esc(line.brandName+" · "+line.productName)}</span><strong>${number(line.quantity)}</strong></div>`).join("")}</div><div class="stats-strip" style="margin:0"><div class="mini-stat"><span>Units</span><strong>${number(order.totalQty)}</strong></div><div class="mini-stat"><span>Value</span><strong>${money(order.grandTotal)}</strong></div></div>${order.reviewReason?`<div class="callout ${order.status==="REJECTED"?"callout-warning":""}" style="margin-top:10px">${esc(order.reviewReason)}</div>`:""}${currentRole===ROLES.SALES_HEAD&&order.status==="SUBMITTED"?`<div class="inline-actions" style="margin-top:12px"><button class="btn btn-primary" data-action="approve-field-order" data-id="${order.id}">${icon("check")}Approve</button><button class="btn btn-danger-soft" data-action="reject-field-order" data-id="${order.id}">Reject</button></div>`:""}</article>`).join("")}</div>`;
+      return `<div class="table-wrap"><table><thead><tr><th>Order</th><th>Party</th><th>Hierarchy</th><th>Products</th><th>Qty</th><th>Value</th><th>Status</th><th>Action</th></tr></thead><tbody>${capRows(rows).map(order=>`<tr><td><div class="cell-main">${esc(order.orderNumber)}</div><div class="cell-sub">${dateFmt(order.orderDate)}</div></td><td><div class="cell-main">${esc(order.partyName)}</div><div class="cell-sub">${esc(order.partyCode||"")}</div></td><td><div>${esc(order.salesmanName)}</div><div class="cell-sub">Head: ${esc(order.salesHeadName)}</div></td><td>${order.items.map(line=>`<div style="padding:3px 0">${esc(line.brandName+" · "+line.productName)} <strong>× ${number(line.quantity)}</strong></div>`).join("")}</td><td><strong>${number(order.totalQty)}</strong></td><td class="money"><strong>${money(order.grandTotal)}</strong></td><td>${workflowStatus(order.status)}${order.billingOrderNo?`<div class="cell-sub">${esc(order.billingOrderNo)}</div>`:""}</td><td>${isBackOfficeRole()&&order.status==="APPROVED"?`<button class="btn btn-sm btn-primary" data-action="send-field-order-billing" data-id="${order.id}">Send to Billing</button>`:order.status==="BILLING_PENDING"?`<button class="btn btn-sm" data-action="open-billing-order">Open Sales Desk</button>`:"—"}</td></tr>`).join("")}</tbody></table></div>`;
     };
     const renderOrderManagement=async db=>{
       const scope=visibleSalesmanIds(db),isSalesman=currentRole===ROLES.SALESMAN;
@@ -5247,7 +5524,7 @@
     const planList=(db,rows,accountMap)=>{
       if(!rows.length)return emptyState("No plans for this date","Salesman collection plans will appear here.","collection");
       if(isFieldRole())return `<div class="mobile-list">${rows.map(plan=>`<article class="mobile-list-card"><div class="card-head" style="padding:0 0 10px"><div><h3>${esc(plan.partyName)}</h3><div class="cell-sub">${dateFmt(plan.date)} · ${esc(plan.partyCode||"")}</div></div>${workflowStatus(plan.status)}</div><div class="hierarchy-line">${esc(plan.salesmanName)} → ${esc(plan.salesHeadName)}</div><div class="mobile-kpi-grid"><div class="mobile-kpi"><span>Plan</span><strong>${money(plan.plannedAmount)}</strong></div><div class="mobile-kpi"><span>Received</span><strong>${money(plan.receivedAmount)}</strong></div><div class="mobile-kpi"><span>Balance</span><strong>${money(Math.max(0,plan.plannedAmount-plan.receivedAmount))}</strong></div><div class="mobile-kpi"><span>Party Due</span><strong>${money(accountMap.get(plan.partyId)?.receivable||0)}</strong></div></div>${plan.remarks?`<div class="cell-sub" style="margin-top:10px">${esc(plan.remarks)}</div>`:""}</article>`).join("")}</div>`;
-      return `<div class="table-wrap"><table><thead><tr><th>Party</th><th>Hierarchy</th><th>Party Due</th><th>Plan</th><th>Received</th><th>Balance</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows.map(plan=>`<tr><td><div class="cell-main">${esc(plan.partyName)}</div><div class="cell-sub">${esc(plan.partyCode||"")}</div></td><td><div>${esc(plan.salesmanName)}</div><div class="cell-sub">Head: ${esc(plan.salesHeadName)}</div></td><td class="money">${money(accountMap.get(plan.partyId)?.receivable||0)}</td><td class="money"><strong>${money(plan.plannedAmount)}</strong></td><td class="money positive"><strong>${money(plan.receivedAmount)}</strong></td><td class="money">${money(Math.max(0,plan.plannedAmount-plan.receivedAmount))}</td><td>${workflowStatus(plan.status)}</td><td>${isBackOfficeRole()?`<button class="btn btn-sm btn-primary" data-action="add-plan-received" data-id="${plan.id}">${icon("plus")}Received</button>`:"—"}</td></tr>`).join("")}</tbody></table></div>`;
+      return `<div class="table-wrap"><table><thead><tr><th>Party</th><th>Hierarchy</th><th>Party Due</th><th>Plan</th><th>Received</th><th>Balance</th><th>Status</th><th>Action</th></tr></thead><tbody>${capRows(rows).map(plan=>`<tr><td><div class="cell-main">${esc(plan.partyName)}</div><div class="cell-sub">${esc(plan.partyCode||"")}</div></td><td><div>${esc(plan.salesmanName)}</div><div class="cell-sub">Head: ${esc(plan.salesHeadName)}</div></td><td class="money">${money(accountMap.get(plan.partyId)?.receivable||0)}</td><td class="money"><strong>${money(plan.plannedAmount)}</strong></td><td class="money positive"><strong>${money(plan.receivedAmount)}</strong></td><td class="money">${money(Math.max(0,plan.plannedAmount-plan.receivedAmount))}</td><td>${workflowStatus(plan.status)}</td><td>${isBackOfficeRole()?`<button class="btn btn-sm btn-primary" data-action="add-plan-received" data-id="${plan.id}">${icon("plus")}Received</button>`:"—"}</td></tr>`).join("")}</tbody></table></div>`;
     };
     const renderPlanReceived=async db=>{
       state.planDate||=localDateISO();state.planDraft.date||=state.planDate;
@@ -5276,7 +5553,10 @@
     };
 
     // Settings and cloud backup
-    const renderSettings = async db => `<div class="page">${pageHeader("Settings","Company details, data backup and access controls.")}
+    const renderSettings = async db => {
+      // Audit rows live only in the cloud; the last 100 are fetched just for this screen.
+      const auditLogs = await dataService.getAuditLogs(100).catch(error => { console.error("Unable to read audit log", error); return []; });
+      return `<div class="page">${pageHeader("Settings","Company details, data backup and access controls.")}
       <div class="grid grid-2">
         <section class="card"><div class="card-head"><h3>Company & invoice</h3></div><div class="card-body"><form id="settings-form">
           <div class="field"><label>Company Name</label><input class="input" name="companyName" value="${attr(db.settings.companyName)}"></div>
@@ -5306,10 +5586,11 @@
           ${isAdminRole()?`<section class="card danger-zone"><div class="card-head"><h3>Data Controls</h3></div><div class="card-body"><p style="color:var(--muted);margin-top:0">Clear removes all masters and operational records while preserving company settings and user profiles.</p><div class="inline-actions"><button class="btn btn-danger-soft" data-action="clear-data">Clear Business Data</button></div></div></section>`:""}
         </div>
         <section class="card span-2"><div class="card-head"><h3>Recent audit log</h3><span class="badge">Last 100 actions</span></div>
-          ${db.auditLogs.length?`<div class="table-wrap"><table><thead><tr><th>Timestamp</th><th>Action</th><th>Record Type</th><th>Record ID</th><th>User</th></tr></thead><tbody>${db.auditLogs.slice(0,100).map(row=>`<tr><td>${dateTimeFmt(row.timestamp)}</td><td class="cell-main">${esc(row.action)}</td><td>${esc(statusLabel(row.recordType))}</td><td class="mono">${esc(row.recordId)}</td><td>${esc(row.user)}</td></tr>`).join("")}</tbody></table></div>`:emptyState("No audit entries","Important actions will be logged here.","reports")}
+          ${auditLogs.length?`<div class="table-wrap"><table><thead><tr><th>Timestamp</th><th>Action</th><th>Record Type</th><th>Record ID</th><th>User</th></tr></thead><tbody>${auditLogs.slice(0,100).map(row=>`<tr><td>${dateTimeFmt(row.timestamp)}</td><td class="cell-main">${esc(row.action)}</td><td>${esc(statusLabel(row.recordType))}</td><td class="mono">${esc(row.recordId)}</td><td>${esc(row.user)}</td></tr>`).join("")}</tbody></table></div>`:emptyState("No audit entries","Important actions will be logged here.","reports")}
         </section>
       </div>
     </div>`;
+    };
 
     // IMEI 360° detail drawer
     const openIMEI360 = async imei => {
@@ -5359,6 +5640,7 @@
       const main=$("#main");
       main.innerHTML='<div class="page"><div class="card card-pad"><div class="skeleton" style="width:28%"></div><div class="skeleton" style="width:72%;margin-top:12px"></div></div></div>';
       try{
+        await dataService.ensureRouteData(state.route);
         const db=await dataService.getDatabase();
         const renderers={dashboard:renderDashboard,purchase:renderPurchase,fulfillment:renderFulfillment,stock:renderStock,inventory:renderInventory,activation:renderActivation,returns:renderReturns,expenses:renderExpenses,cndn:renderCnDn,money:renderMoney,outstanding:renderOutstanding,ledger:renderLedger,reports:renderReports,pnl:renderPnL,masters:renderMasters,settings:renderSettings,users:renderUsers,"order-management":renderOrderManagement,"plan-received":renderPlanReceived};
         main.innerHTML=await renderers[state.route](db);
@@ -5570,7 +5852,7 @@
     const addPurchaseOrderScans=async value=>{
       const draft=state.purchaseReceiveDraft,candidates=tokenIMEIs(value);
       if(!candidates.length)return;
-      const db=await dataService.getDatabase(),order=db.purchaseOrders.find(row=>row.id===draft.orderId&&row.status==="PENDING"),orderLine=order?.items.find(line=>line.modelId===draft.modelId),model=db.models.find(row=>row.id===draft.modelId);
+      const db=await dataService.getDatabase(["purchaseOrders","purchases","inventory"]),order=db.purchaseOrders.find(row=>row.id===draft.orderId&&row.status==="PENDING"),orderLine=order?.items.find(line=>line.modelId===draft.modelId),model=db.models.find(row=>row.id===draft.modelId);
       if(!order||!orderLine){toast("Select an ordered product first","warning");return;}
       if(isQuantityTracked(model)){toast("This product is quantity-tracked","info","Use Add Quantity instead of scanning");return;}
       const capacity=purchaseOrderLineRemaining(orderLine)-purchaseReceiveModelQty(draft,draft.modelId),inventoryIMEIs=new Set(db.inventory.map(row=>row.imei)),currentIMEIs=new Set((draft.items||[]).map(row=>row.imei));
@@ -5879,7 +6161,7 @@
       showModal({title:"Choose print format",subtitle:sale.invoiceNumber+" · "+sale.customerName,size:"modal-lg",body:`<div class="print-template-grid">${choices.map(choice=>`<button class="mode-choice print-template-card ${choice.id===preferred?"is-default":""}" data-action="execute-sale-print" data-id="${sale.id}" data-template="${choice.id}"><span class="mode-choice-body"><span class="mode-choice-mark" style="width:52px;font-size:${choice.mark.length>3?"8px":"10px"}">${choice.mark}</span><span class="mode-choice-copy"><strong>${esc(choice.title)}</strong><span>${esc(choice.copy)}</span>${choice.id===preferred?'<span class="print-template-default">Default</span>':""}</span></span></button>`).join("")}</div><div class="callout" style="margin-top:14px">${isWarehouseRole()?"Warehouse print formats never show rates or tax.":`<strong>Current default:</strong> ${esc(printTemplateLabel(printTemplateOf(db.settings)))}. Change it anytime from Settings → Default Sale Print Format.`}</div>`,footer:'<button class="btn btn-primary" data-action="close-modal">Close</button>'});
     };
     const printSale=async(id,templateId="")=>{
-      const db=await dataService.getDatabase(),sale=db.sales.find(row=>row.id===id);
+      const db=await dataService.getDatabase(["sales"]),sale=db.sales.find(row=>row.id===id);
       if(!sale){toast("Sale record not found","error");return;}
       if(!templateId){showSalePrintChooser(sale,db);return;}
       if(![PRINT_TEMPLATE.TAX_INVOICE,PRINT_TEMPLATE.IMEI_TRACKING,PRINT_TEMPLATE.DELIVERY_ACK].includes(templateId)){toast("Select a valid print format","error");return;}
@@ -5889,7 +6171,7 @@
       setTimeout(()=>window.print(),50);
     };
     const printCurrentReport=async()=>{
-      const db=await dataService.getDatabase(),asOn=state.reportsType==="party-outstanding",range={from:state.reportFrom||presetRange("month").from,to:state.reportTo||(asOn?localDateISO():presetRange("month").to)},report=buildReport(db,state.reportsType,range.from,range.to);
+      const db=await dataService.getDatabase(REPORT_COLLECTIONS),asOn=state.reportsType==="party-outstanding",range={from:state.reportFrom||presetRange("month").from,to:state.reportTo||(asOn?localDateISO():presetRange("month").to)},report=buildReport(db,state.reportsType,range.from,range.to);
       const needle=lower(state.reportSearch),rows=report.rows.filter(row=>!needle||Object.values(row).some(value=>lower(value).includes(needle))),columns=rows[0]?Object.keys(rows[0]):[];
       $("#print-area").innerHTML=`<article class="invoice-sheet report-sheet"><div class="invoice-title"><div><h1 style="margin:0">${esc(report.title)}</h1><p style="margin:4px 0;color:#526078">${esc(db.settings.companyName)} · ${asOn?"As on "+dateFmt(range.to):dateFmt(range.from)+" – "+dateFmt(range.to)}</p></div><div class="invoice-meta"><p>Generated ${dateTimeFmt(nowISO())}</p><p>${rows.length} records</p></div></div><table class="invoice-table" style="margin-top:15px"><thead><tr>${columns.map(key=>`<th>${esc(key)}</th>`).join("")}</tr></thead><tbody>${rows.map(row=>`<tr>${columns.map(key=>`<td class="${["IMEI","Serial / IMEI"].includes(key)?"mono":""}">${isMoneyColumn(key)&&Number.isFinite(Number(row[key]))?money(row[key]):esc(row[key]??"—")}</td>`).join("")}</tr>`).join("")}</tbody></table></article>`;
       setTimeout(()=>window.print(),50);
@@ -5987,7 +6269,7 @@
       toast("CSV exported","success",rows.length+" rows");
     };
     const sharePlanSnapshot=async()=>{
-      const db=await dataService.getDatabase(),scope=visibleSalesmanIds(db),date=state.planDate||localDateISO();
+      const db=await dataService.getDatabase(["collectionPlans"]),scope=visibleSalesmanIds(db),date=state.planDate||localDateISO();
       let rows=db.collectionPlans.filter(plan=>scope.has(plan.salesmanUserId)&&plan.date===date&&(!state.planSalesmanId||plan.salesmanUserId===state.planSalesmanId));
       const needle=lower(state.planSearch);if(needle)rows=rows.filter(plan=>[plan.partyName,plan.salesmanName,plan.salesHeadName].some(value=>lower(value).includes(needle)));rows.sort((a,b)=>a.partyName.localeCompare(b.partyName));
       const width=1200,rowHeight=52,height=Math.max(520,260+Math.min(rows.length,24)*rowHeight),canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;const ctx=canvas.getContext("2d");
@@ -6008,7 +6290,7 @@
       return Math.abs(account?.payable||0)>Math.abs(account?.receivable||0)?LEDGER_SIDE.SUPPLIER:LEDGER_SIDE.CUSTOMER;
     };
     const openPartyLedger=async(id,preferredSide="")=>{
-      const db=await dataService.getDatabase(),party=db.parties.find(row=>row.id===id);
+      const db=await dataService.getDatabase(LEDGER_COLLECTIONS),party=db.parties.find(row=>row.id===id);
       if(!party){toast("Party ledger not found","error");return;}
       state.ledgerPartyId=party.id;state.ledgerSide=chooseLedgerSide(db,party,preferredSide);state.ledgerSearch="";
       closeModal();navigate("ledger");
@@ -6043,7 +6325,7 @@
       else if(action==="change-purchase-order-supplier"){state.purchaseOrderDraft.supplierId=null;await renderRoute();setTimeout(()=>$("#purchase-order-supplier-search")?.focus(),40);}
       else if(action==="remove-purchase-order-item"){state.purchaseOrderDraft.items=(state.purchaseOrderDraft.items||[]).filter(item=>item.modelId!==element.dataset.modelId);await renderRoute();}
       else if(action==="load-purchase-order"){
-        const db=await dataService.getDatabase(),order=db.purchaseOrders.find(row=>row.id===element.dataset.id&&row.status==="PENDING");if(!order){toast("Pending purchase order not found","error");return;}
+        const db=await dataService.getDatabase(["purchaseOrders","purchases","inventory"]),order=db.purchaseOrders.find(row=>row.id===element.dataset.id&&row.status==="PENDING");if(!order){toast("Pending purchase order not found","error");return;}
         const first=order.items.find(line=>purchaseOrderLineRemaining(line)>0);state.purchaseReceiveDraft={orderId:order.id,invoiceNumber:nextDocumentPreview(db.purchases,"PI","invoiceNumber"),invoiceDate:localDateISO(),modelId:first?.modelId||"",items:[],quantityItems:[]};state.purchaseTab="receive";await renderRoute();
       }
       else if(action==="cancel-purchase-order"){
@@ -6065,7 +6347,7 @@
         if(result){state.purchaseImport=null;state.purchaseImportSetup={supplierId:"",invoiceNumber:"",invoiceDate:""};state.purchaseImportSupplierSearch="";state.purchaseTab="history";await renderRoute();}
       }
       else if(action==="export-purchases"){
-        const db=await dataService.getDatabase();exportRows("purchase-report-"+localDateISO()+".csv",buildReport(db,"purchase-report","","").rows);
+        const db=await dataService.getDatabase(["purchases"]);exportRows("purchase-report-"+localDateISO()+".csv",buildReport(db,"purchase-report","","").rows);
       }
       else if(action==="view-purchase")await showPurchaseView(element.dataset.id);
       else if(action==="filter-aging"){state.inventoryAging=state.inventoryAging===element.dataset.bucket?"":element.dataset.bucket;state.inventoryPage=1;await renderRoute();}
@@ -6074,7 +6356,7 @@
       else if(action==="stock-brand-filter"){state.stockBrandId=element.dataset.brandId||"";await renderRoute();}
       else if(action==="view-model-stock")await showModelStock(element.dataset.modelId);
       else if(action==="export-inventory"){
-        const db=await dataService.getDatabase(),imeis=new Set(getFilteredInventory(db).map(row=>row.imei)),report=buildReport(db,"imei-stock","","");
+        const db=await dataService.getDatabase(["inventory"]),imeis=new Set(getFilteredInventory(db).map(row=>row.imei)),report=buildReport(db,"imei-stock","","");
         exportRows("imei-stock-current-view-"+localDateISO()+".csv",report.rows.filter(row=>imeis.has(row.IMEI)));
       }
       else if(action==="imei-360")await openIMEI360(element.dataset.imei);
@@ -6089,11 +6371,11 @@
         if(result){toast(result.created+" new · "+result.updated+" updated · "+result.unmatched+" unmatched","info",result.duplicatesMerged+" duplicate rows merged; last valid date used");state.activationImport=null;state.activationTab="report";await renderRoute();}
       }
       else if(action==="export-activation-report"){
-        const db=await dataService.getDatabase(),imeis=new Set(getFilteredActivationInventory(db).map(row=>row.imei));
+        const db=await dataService.getDatabase(["inventory","activations","sales"]),imeis=new Set(getFilteredActivationInventory(db).map(row=>row.imei));
         exportRows("activation-report-"+localDateISO()+".csv",buildReport(db,"activation-report","","").rows.filter(row=>imeis.has(row.IMEI)));
       }
       else if(action==="export-unmatched"){
-        const db=await dataService.getDatabase();exportRows("unmatched-activation-"+localDateISO()+".csv",buildReport(db,"unmatched-activation","","").rows);
+        const db=await dataService.getDatabase(["unmatchedActivations"]);exportRows("unmatched-activation-"+localDateISO()+".csv",buildReport(db,"unmatched-activation","","").rows);
       }
       else if(action==="fulfillment-tab"){state.fulfillmentTab=element.dataset.tab;await renderRoute();}
       else if(action==="select-order-party"){
@@ -6106,7 +6388,7 @@
         state.saleOrderDraft.items=(state.saleOrderDraft.items||[]).filter(item=>item.modelId!==element.dataset.modelId);await renderRoute();
       }
       else if(action==="load-sale-order"){
-        const db=await dataService.getDatabase(),order=db.saleOrders.find(row=>row.id===element.dataset.id&&row.status==="PENDING");
+        const db=await dataService.getDatabase(["saleOrders","inventory","sales"]),order=db.saleOrders.find(row=>row.id===element.dataset.id&&row.status==="PENDING");
         if(!order){toast("Pending order not found","error");return;}
         state.saleDraft={customerType:CUSTOMER_TYPE.PARTY,customerId:order.partyId,cashBuyer:emptyCashBuyer(),cashBuyerSearch:"",orderId:order.id,invoiceNumber:isTallyParallelMode(db.settings)?"":"",invoiceDate:localDateISO(),items:[],saleType:order.saleType||SALE_TYPE.NORMAL,priceOverrideReason:order.priceOverrideReason||"",remarks:order.remarks||""};
         const quantityLine=saleOrderLines(order).find(line=>isQuantityTracked(db.models.find(model=>model.id===line.modelId))&&saleOrderLineRemaining(line)>0);
@@ -6132,7 +6414,7 @@
         state.saleDraft.customerType=next;state.saleDraft.customerId=null;state.saleDraft.cashBuyer=emptyCashBuyer();state.saleDraft.cashBuyerSearch="";state.quantitySaleDraft={brandId:"",modelId:"",quantity:""};await renderRoute();
       }
       else if(action==="select-cash-buyer"){
-        const db=await dataService.getDatabase(),sale=db.sales.find(row=>row.id===element.dataset.id&&customerTypeOf(row)===CUSTOMER_TYPE.CASH);
+        const db=await dataService.getDatabase(["sales"]),sale=db.sales.find(row=>row.id===element.dataset.id&&customerTypeOf(row)===CUSTOMER_TYPE.CASH);
         if(!sale){toast("Cash buyer record not found","error");return;}
         const currentMobile=clean(state.saleDraft.cashBuyer?.mobile).replace(/\D/g,""),nextMobile=clean(sale.customerMobile).replace(/\D/g,"");
         if(state.saleDraft.items.length&&currentMobile&&currentMobile!==nextMobile){const ok=await confirmAction({title:"Change cash buyer?",message:"Changing the buyer will clear current invoice items.",confirmLabel:"Change Buyer",danger:true});if(!ok)return;state.saleDraft.items=[];state.quantitySaleDraft={brandId:"",modelId:"",quantity:""};}
@@ -6148,11 +6430,11 @@
       else if(action==="execute-sale-print")await printSale(element.dataset.id,element.dataset.template);
       else if(action==="preview-sale-print-template")await previewSalePrintTemplate();
       else if(action==="cancel-sale"){
-        const ok=await confirmAction({title:"Void sales invoice?",message:"The invoice remains in history and every eligible serial or quantity returns to Available Stock. If this invoice completed a quantity order, that order reopens as Pending.",confirmLabel:"Void Invoice",danger:true});
-        if(ok){const result=await execute(()=>dataService.cancelSale(element.dataset.id),"Invoice voided");if(result){closeModal();await renderRoute();if(result.reopenedOrder)toast("Order "+result.reopenedOrder.orderNo+" reopened as Pending","warning","Fulfil it again from Pending Orders");}}
+        const ok=await confirmAction({title:"Void sales invoice?",message:"The invoice remains in history and every eligible serial or quantity returns to Available Stock. Any amount received at billing against this invoice is voided too. If this invoice completed a quantity order, that order reopens as Pending.",confirmLabel:"Void Invoice",danger:true});
+        if(ok){const result=await execute(()=>dataService.cancelSale(element.dataset.id),"Invoice voided");if(result){closeModal();await renderRoute();if(result.voidedCollections?.length)toast("Billing collection voided","warning",result.voidedCollections.map(row=>row.voucherNumber+" · "+money(row.amount)).join(" · "));if(result.reopenedOrder)toast("Order "+result.reopenedOrder.orderNo+" reopened as Pending","warning","Fulfil it again from Pending Orders");}}
       }
       else if(action==="export-sales"){
-        const db=await dataService.getDatabase(),ids=new Set(getFilteredSales(db).map(row=>row.id));
+        const db=await dataService.getDatabase(["sales"]),ids=new Set(getFilteredSales(db).map(row=>row.id));
         const rows=buildReport(db,"sales-report","","").rows.filter(row=>db.sales.some(sale=>ids.has(sale.id)&&sale.invoiceNumber===row["Invoice / Tally Ref"]));
         exportRows("sales-report-current-view-"+localDateISO()+".csv",rows);
       }
@@ -6160,7 +6442,7 @@
       else if(action==="return-tracking"){state.returnTracking=element.dataset.tracking===TRACKING_MODE.QUANTITY?TRACKING_MODE.QUANTITY:TRACKING_MODE.SERIAL;state.returnLookup=null;await renderRoute();}
       else if(action==="clear-return-lookup"){state.returnLookup=null;await renderRoute();}
       else if(action==="export-returns"){
-        const db=await dataService.getDatabase();const rows=[...buildReport(db,"sales-return","","").rows,...buildReport(db,"purchase-return","","").rows];exportRows("returns-"+localDateISO()+".csv",rows);
+        const db=await dataService.getDatabase(["returns","sales","purchases"]);const rows=[...buildReport(db,"sales-return","","").rows,...buildReport(db,"purchase-return","","").rows];exportRows("returns-"+localDateISO()+".csv",rows);
       }
       else if(action==="add-party")await showPartyEditor();
       else if(action==="edit-party")await showPartyEditor(element.dataset.id);
@@ -6168,7 +6450,7 @@
       else if(action==="expense-preset"){state.expenseRange=element.dataset.preset;await renderRoute();}
       else if(action==="cndn-preset"){state.cndnPreset=element.dataset.preset;await renderRoute();}
       else if(action==="export-cndn"){
-        const db=await dataService.getDatabase(),range=presetRange(state.cndnPreset==="custom"?"month":state.cndnPreset),from=state.cndnPreset==="custom"?(state.cndnFrom||range.from):range.from,to=state.cndnPreset==="custom"?(state.cndnTo||range.to):range.to;
+        const db=await dataService.getDatabase(["notes"]),range=presetRange(state.cndnPreset==="custom"?"month":state.cndnPreset),from=state.cndnPreset==="custom"?(state.cndnFrom||range.from):range.from,to=state.cndnPreset==="custom"?(state.cndnTo||range.to):range.to;
         exportRows("cn-dn-"+localDateISO()+".csv",buildReport(db,"cndn-report",from,to).rows);
       }
       else if(action==="money-tab"){
@@ -6180,13 +6462,13 @@
       else if(action==="change-money-party"){state.moneyPartyId="";state.moneyPartySearch="";await renderRoute();setTimeout(()=>$("#money-party-search")?.focus(),40);}
       else if(action==="view-money")await showMoneyView(element.dataset.id);
       else if(action==="void-money"){
-        const db=await dataService.getDatabase(),row=db.payments.find(item=>item.id===element.dataset.id);
+        const db=await dataService.getDatabase(["payments"]),row=db.payments.find(item=>item.id===element.dataset.id);
         if(!row)return;
         const ok=await confirmAction({title:"Void "+row.voucherNumber+"?",message:"The voucher will remain in the audit trail but will stop affecting party outstanding and ledger balance.",confirmLabel:"Void Voucher",danger:true});
         if(ok){const result=await execute(()=>dataService.voidMoneyTransaction(row.id),"Voucher voided");if(result){state.moneyFilters.status="";closeModal();await renderRoute();}}
       }
       else if(action==="export-money"){
-        const db=await dataService.getDatabase(),rows=getFilteredMoneyTransactions(db).map(row=>({Date:row.date,Voucher:row.voucherNumber,Type:moneyTypeLabel(row.type),Party:row.partyName,Mode:paymentModeLabel(row.mode),Reference:row.reference,Amount:row.amount,Status:statusLabel(row.status),Remarks:row.remarks}));
+        const db=await dataService.getDatabase(["payments"]),rows=getFilteredMoneyTransactions(db).map(row=>({Date:row.date,Voucher:row.voucherNumber,Type:moneyTypeLabel(row.type),Party:row.partyName,Mode:paymentModeLabel(row.mode),Reference:row.reference,Amount:row.amount,Status:statusLabel(row.status),Remarks:row.remarks}));
         exportRows("collection-payment-"+localDateISO()+".csv",rows);
       }
       else if(action==="open-ledger")await openPartyLedger(element.dataset.id,element.dataset.side);
@@ -6235,7 +6517,7 @@
       else if(action==="add-expense-head")await showExpenseHeadEditor();
       else if(action==="edit-expense-head")await showExpenseHeadEditor(element.dataset.id);
       else if(action==="export-report"){
-        const db=await dataService.getDatabase(),asOn=state.reportsType==="party-outstanding",report=buildReport(db,state.reportsType,state.reportFrom||presetRange("month").from,state.reportTo||(asOn?localDateISO():presetRange("month").to));
+        const db=await dataService.getDatabase(REPORT_COLLECTIONS),asOn=state.reportsType==="party-outstanding",report=buildReport(db,state.reportsType,state.reportFrom||presetRange("month").from,state.reportTo||(asOn?localDateISO():presetRange("month").to));
         const needle=lower(state.reportSearch),rows=report.rows.filter(row=>!needle||Object.values(row).some(value=>lower(value).includes(needle)));
         exportRows(state.reportsType+"-"+localDateISO()+".csv",rows);
       }
@@ -6428,7 +6710,7 @@
       else if(target.id==="cndn-to"){state.cndnTo=target.value;await renderRoute();}
       else if(target.id==="cndn-party"){
         state.cndnPartyId=target.value;
-        const db=await dataService.getDatabase(),party=db.parties.find(row=>row.id===target.value);
+        const db=await dataService.getDatabase(LEDGER_COLLECTIONS),party=db.parties.find(row=>row.id===target.value);
         if(party?.type==="SUPPLIER")state.cndnLedgerSide=LEDGER_SIDE.SUPPLIER;
         else if(party?.type==="CUSTOMER")state.cndnLedgerSide=LEDGER_SIDE.CUSTOMER;
         await renderRoute();
@@ -6562,7 +6844,7 @@
     });
     const lookupReturnIMEI=async imei=>{
       if(!isValidIMEI(imei)){toast("Enter a valid Serial / IMEI","error","Use 6–40 supported characters");return;}
-      const db=await dataService.getDatabase(),inv=db.inventory.find(row=>row.imei===imei);
+      const db=await dataService.getDatabase(["inventory","sales","purchases"]),inv=db.inventory.find(row=>row.imei===imei);
       if(!inv){toast("IMEI not found","error");return;}
       const maps=getMaps(db),isSales=state.returnsTab==="sales";
       let source,value;

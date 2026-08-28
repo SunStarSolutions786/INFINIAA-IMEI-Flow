@@ -1,0 +1,22 @@
+{
+  "//": "Composite indexes for the on-demand log queries. The app falls back to an unsorted page until these exist, so it works before they finish building. Deploy with: firebase deploy --only firestore:indexes",
+  "indexes": [
+    {
+      "collectionGroup": "priceLogs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "modelId", "order": "ASCENDING" },
+        { "fieldPath": "changedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "stockMovements",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "modelId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
