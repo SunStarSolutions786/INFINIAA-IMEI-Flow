@@ -1373,14 +1373,14 @@
 <body>
   <div class="auth-gate" id="auth-gate">
     <div class="auth-shell">
-      <div class="auth-brand"><div class="auth-brand-mark">INFINIAA</div><div class="auth-brand-copy"><h1>IMEI Flow</h1><p>Secure cloud stock · sales · billing</p></div></div>
+      <div class="auth-brand"><div class="auth-brand-mark">INFINIAA</div><div class="auth-brand-copy"><h1>IMEI Flow</h1><p>Stock · Sales · Billing</p></div></div>
       <section class="auth-card">
-        <div class="auth-card-head"><h2>Sign in</h2><p>Use your Firebase user email and password.</p></div>
+        <div class="auth-card-head"><h2>Sign in</h2></div>
         <div class="auth-card-body">
           <form id="login-form">
             <div class="field"><label>Email <span class="required">*</span></label><input class="input" type="email" name="email" autocomplete="username" placeholder="name@company.com" required></div>
             <div class="field"><label>Password <span class="required">*</span></label><input class="input" type="password" name="password" autocomplete="current-password" minlength="6" required></div>
-            <button class="btn btn-primary auth-submit" type="submit">Sign in securely</button>
+            <button class="btn btn-primary auth-submit" type="submit">Sign in</button>
           </form>
           <div class="auth-status" id="auth-status" role="status" aria-live="polite"></div>
         </div>
@@ -1426,7 +1426,7 @@
       </div>
       <div class="top-date" id="top-date"></div>
       <button class="icon-button" id="theme-toggle" aria-label="Toggle dark mode"><span data-icon="moon"></span></button>
-      <button class="profile" data-action="account-menu" aria-label="Open account menu"><div class="avatar" id="profile-avatar">--</div><div><strong id="profile-name">Loading…</strong><small id="profile-role">Firebase account</small></div></button>
+      <button class="profile" data-action="account-menu" aria-label="Open account menu"><div class="avatar" id="profile-avatar">--</div><div><strong id="profile-name">Loading…</strong><small id="profile-role">User Account</small></div></button>
     </header>
     <main class="main" id="main"><div class="page"><div class="card card-pad"><div class="skeleton" style="width:30%"></div><div class="skeleton" style="width:70%;margin-top:12px"></div></div></div></main>
     <nav class="field-bottom-nav" aria-label="Field navigation"><button class="field-bottom-link" data-route="order-management"><span data-icon="sales"></span><span>Orders</span></button><button class="field-bottom-link" data-route="plan-received"><span data-icon="collection"></span><span>Plan / Received</span></button></nav>
@@ -2262,8 +2262,8 @@
       let liveRefreshTimer = null;
 
       const hydrateDatabase = loaded => {
-        if (!loaded) throw new Error("Cloud workspace is not initialized. Contact the Administrator.");
-        if (loaded.meta?.schemaVersion !== SCHEMA_VERSION) throw new Error("This cloud database uses an unsupported schema version.");
+        if (!loaded) throw new Error("Your account is not ready. Contact the Administrator.");
+        if (loaded.meta?.schemaVersion !== SCHEMA_VERSION) throw new Error("The application needs an update. Contact the Administrator.");
         const base = createEmptyDatabase();
         FIRESTORE_COLLECTIONS.forEach(name => { base[name] = Array.isArray(loaded[name]) ? loaded[name] : []; });
         base.meta = { ...base.meta, ...(loaded.meta || {}) };
@@ -2276,7 +2276,7 @@
       };
       const refreshDatabase = async () => hydrateDatabase(await firestoreStorageAdapter.load());
       const get = () => {
-        if (!database) throw new Error("Cloud data is not ready yet");
+        if (!database) throw new Error("Data is not ready yet. Please try again.");
         return database;
       };
       const audit = (draft, action, recordType, recordId, oldValue, newValue) => {
@@ -2376,9 +2376,9 @@
         return prefix + "-" + String(maximum + 1).padStart(4, "0");
       };
       const validateDatabase = candidate => {
-        if (!candidate || typeof candidate !== "object") throw new Error("Backup is not a valid database object");
-        if (candidate.meta?.schemaVersion !== SCHEMA_VERSION) throw new Error("Unsupported backup schema version");
-        if (!candidate.settings || typeof candidate.settings !== "object" || Array.isArray(candidate.settings)) throw new Error("Backup is missing settings");
+        if (!candidate || typeof candidate !== "object") throw new Error("The selected backup file is invalid.");
+        if (candidate.meta?.schemaVersion !== SCHEMA_VERSION) throw new Error("This backup file is not supported.");
+        if (!candidate.settings || typeof candidate.settings !== "object" || Array.isArray(candidate.settings)) throw new Error("The backup file is incomplete.");
         if (candidate.settings.operatingMode && !isSupportedOperatingMode(candidate.settings.operatingMode)) throw new Error("Backup contains an invalid operating mode");
         if (candidate.settings.salePrintTemplate && !isSupportedPrintTemplate(candidate.settings.salePrintTemplate)) throw new Error("Backup contains an invalid sale print template");
         candidate.saleOrders ||= [];
@@ -2682,7 +2682,7 @@
         async saveUser(values) {
           if(!isAdminRole())throw new Error("Only Admin can manage users");
           const isNew=!clean(values.id),email=lower(values.email),password=clean(values.password);
-          if(isNew&&(!email||!email.includes("@")))throw new Error("A valid Firebase login email is required");
+          if(isNew&&(!email||!email.includes("@")))throw new Error("A valid login email is required");
           if(isNew&&password.length<8)throw new Error("Password must be at least 8 characters");
           let provisioned=null;
           if(isNew)provisioned=await provisionFirebaseUser(email,password);
@@ -2701,7 +2701,7 @@
                 if(hasLinks)throw new Error("Role cannot be changed after hierarchy or transaction mapping exists");
               }
               const loginEmail=existing?.email||email;
-              if(draft.users.some(user=>lower(user.email)===loginEmail&&user.id!==(existing?.id||provisioned.uid)))throw new Error("This Firebase email is already mapped");
+              if(draft.users.some(user=>lower(user.email)===loginEmail&&user.id!==(existing?.id||provisioned.uid)))throw new Error("This login email is already in use");
               const payload={name,loginId:loginEmail,mobile:clean(values.mobile),email:loginEmail,role,reportsToUserId,status};
               let record;
               if(existing){const oldValue=clone(existing);Object.assign(existing,payload,{updatedAt:nowISO()});record=existing;if(role===ROLES.SALESMAN&&oldValue.reportsToUserId!==reportsToUserId){const nextHead=draft.users.find(user=>user.id===reportsToUserId);draft.fieldOrders.filter(order=>order.salesmanUserId===existing.id&&order.status==="SUBMITTED").forEach(order=>{order.salesHeadUserId=nextHead.id;order.salesHeadName=nextHead.name;order.reassignedAt=nowISO();});draft.collectionPlans.filter(plan=>plan.salesmanUserId===existing.id&&["OPEN","PARTIAL"].includes(plan.status)).forEach(plan=>{plan.salesHeadUserId=nextHead.id;plan.salesHeadName=nextHead.name;plan.reassignedAt=nowISO();});}audit(draft,"User Updated","USER",record.id,oldValue,record);}
@@ -3668,7 +3668,7 @@
         },
         async exportBackup() { return JSON.stringify(get(), null, 2); },
         async importBackup(candidate) {
-          if(!isAdminRole())throw new Error("Only Admin can restore a cloud backup");
+          if(!isAdminRole())throw new Error("Only Admin can restore a backup");
           const current=clone(await refreshDatabase());
           const incoming=clone(candidate);
           validateDatabase(incoming);
@@ -3683,7 +3683,7 @@
           return true;
         },
         async clearAllData() {
-          if(!isAdminRole())throw new Error("Only Admin can clear cloud data");
+          if(!isAdminRole())throw new Error("Only Admin can clear business data");
           const current=clone(await refreshDatabase());
           const next = createEmptyDatabase();
           next.settings = clone(current.settings);
@@ -5208,7 +5208,7 @@
       return `<div class="page">${pageHeader("User Management","Create users, assign roles and map every Salesman to one Sales Head.",`<button class="btn btn-primary" data-action="add-user">${icon("plus")}New User</button>`)}
         <div class="kpi-grid" style="margin-bottom:16px">${counts.map(([label,value])=>kpiCard(label,value,"Active users")).join("")}</div>
         <section class="card"><div class="toolbar"><div class="field" style="min-width:240px;flex:1"><label>Search</label><div class="input-icon"><span data-icon="search"></span><input class="input" id="user-search" value="${attr(state.userSearch)}" placeholder="Name, login, mobile or reporting head"></div></div><div class="field"><label>Role</label><select class="select" id="user-role-filter"><option value="">All roles</option>${Object.values(ROLES).map(role=>`<option value="${role}" ${roleFilter===role?"selected":""}>${esc(roleLabel(role))}</option>`).join("")}</select></div><div class="toolbar-spacer"></div><span class="badge badge-info">${rows.length} users</span></div>
-        ${rows.length?`<div class="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Contact</th><th>Reports To</th><th>Mapped Parties</th><th>Status</th><th></th></tr></thead><tbody>${rows.map(user=>{const head=userMap.get(user.reportsToUserId),mapped=db.parties.filter(party=>party.salesmanUserId===user.id).length;return `<tr><td><div class="cell-main">${esc(user.name)}</div><div class="cell-sub">${esc(user.email||user.loginId)}</div></td><td><span class="role-chip">${esc(roleLabel(user.role))}</span></td><td><div>${esc(user.mobile||"—")}</div><div class="cell-sub">Firebase Auth</div></td><td>${user.role===ROLES.SALESMAN?`<div class="cell-main">${esc(head?.name||"Not mapped")}</div><div class="cell-sub">Sales Head</div>`:"—"}</td><td>${user.role===ROLES.SALESMAN?`<strong>${mapped}</strong>`:"—"}</td><td>${statusBadge(user.status)}</td><td><div class="inline-actions"><button class="btn btn-sm" data-action="edit-user" data-id="${user.id}">Edit</button><button class="btn btn-sm" data-action="reset-user-password" data-email="${attr(user.email)}">Reset Password</button></div></td></tr>`;}).join("")}</tbody></table></div>`:emptyState("No matching users","Change the search or role filter.","parties")}</section>
+        ${rows.length?`<div class="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Contact</th><th>Reports To</th><th>Mapped Parties</th><th>Status</th><th></th></tr></thead><tbody>${rows.map(user=>{const head=userMap.get(user.reportsToUserId),mapped=db.parties.filter(party=>party.salesmanUserId===user.id).length;return `<tr><td><div class="cell-main">${esc(user.name)}</div><div class="cell-sub">${esc(user.email||user.loginId)}</div></td><td><span class="role-chip">${esc(roleLabel(user.role))}</span></td><td><div>${esc(user.mobile||"—")}</div><div class="cell-sub">Login Account</div></td><td>${user.role===ROLES.SALESMAN?`<div class="cell-main">${esc(head?.name||"Not mapped")}</div><div class="cell-sub">Sales Head</div>`:"—"}</td><td>${user.role===ROLES.SALESMAN?`<strong>${mapped}</strong>`:"—"}</td><td>${statusBadge(user.status)}</td><td><div class="inline-actions"><button class="btn btn-sm" data-action="edit-user" data-id="${user.id}">Edit</button><button class="btn btn-sm" data-action="reset-user-password" data-email="${attr(user.email)}">Reset Password</button></div></td></tr>`;}).join("")}</tbody></table></div>`:emptyState("No matching users","Change the search or role filter.","parties")}</section>
         <div class="callout" style="margin-top:16px"><strong>Visibility rule:</strong> Salesman sees mapped parties only; Sales Head sees only mapped Salesmen and their parties; Admin / Back Office sees all field data. Warehouse receives only approved billing orders.</div>
       </div>`;
     };
@@ -5276,7 +5276,7 @@
     };
 
     // Settings and cloud backup
-    const renderSettings = async db => `<div class="page">${pageHeader("Settings","Company details, cloud backup and secured data controls.")}
+    const renderSettings = async db => `<div class="page">${pageHeader("Settings","Company details, data backup and access controls.")}
       <div class="grid grid-2">
         <section class="card"><div class="card-head"><h3>Company & invoice</h3></div><div class="card-body"><form id="settings-form">
           <div class="field"><label>Company Name</label><input class="input" name="companyName" value="${attr(db.settings.companyName)}"></div>
@@ -5301,9 +5301,9 @@
           <button class="btn btn-primary" type="submit">Save Settings</button>
         </form></div></section>
         <div class="grid">
-          <section class="card"><div class="card-head"><h3>Cloud backup</h3><span class="badge badge-success">Firebase Firestore</span></div><div class="card-body"><p style="color:var(--muted);margin-top:0">Export the complete versioned cloud database as JSON${isAdminRole()?", or restore business data from a validated backup. Firebase Auth users are preserved.":"."}</p><div class="inline-actions"><button class="btn" data-action="export-backup">${icon("download")}Export Backup</button>${isAdminRole()?`<button class="btn" data-action="choose-backup">${icon("upload")}Import Backup</button>`:""}<button class="btn" data-action="refresh-cloud">Refresh Cloud</button></div></div></section>
-          <section class="card"><div class="card-head"><h3>Firestore summary</h3></div><div class="card-body"><div class="stats-strip" style="margin:0">${[["Schema",db.meta.schemaVersion],["Revision",db.meta.revision||0],["IMEIs",db.inventory.length],["Quantity Units",sum(db.quantityStock,row=>Number(row.quantity)+Number(row.damagedQty))],["Purchases",db.purchases.length],["Sales",db.sales.length],["Returns",db.returns.length],["Money Vouchers",db.payments.length]].map(([label,value])=>`<div class="mini-stat"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div></div></section>
-          ${isAdminRole()?`<section class="card danger-zone"><div class="card-head"><h3>Cloud data controls</h3></div><div class="card-body"><p style="color:var(--muted);margin-top:0">Clear removes all masters and operational records from Firestore while preserving company settings and Firebase user profiles.</p><div class="inline-actions"><button class="btn btn-danger-soft" data-action="clear-data">Clear Cloud Business Data</button></div></div></section>`:""}
+          <section class="card"><div class="card-head"><h3>Data Backup</h3><span class="badge badge-success">Ready</span></div><div class="card-body"><p style="color:var(--muted);margin-top:0">Export a complete JSON backup${isAdminRole()?", or restore business data from a valid backup file. User accounts are preserved.":"."}</p><div class="inline-actions"><button class="btn" data-action="export-backup">${icon("download")}Export Backup</button>${isAdminRole()?`<button class="btn" data-action="choose-backup">${icon("upload")}Import Backup</button>`:""}<button class="btn" data-action="refresh-cloud">Refresh Data</button></div></div></section>
+          <section class="card"><div class="card-head"><h3>Data Summary</h3></div><div class="card-body"><div class="stats-strip" style="margin:0">${[["Version",db.meta.schemaVersion],["Updates",db.meta.revision||0],["IMEIs",db.inventory.length],["Quantity Units",sum(db.quantityStock,row=>Number(row.quantity)+Number(row.damagedQty))],["Purchases",db.purchases.length],["Sales",db.sales.length],["Returns",db.returns.length],["Money Vouchers",db.payments.length]].map(([label,value])=>`<div class="mini-stat"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div></div></section>
+          ${isAdminRole()?`<section class="card danger-zone"><div class="card-head"><h3>Data Controls</h3></div><div class="card-body"><p style="color:var(--muted);margin-top:0">Clear removes all masters and operational records while preserving company settings and user profiles.</p><div class="inline-actions"><button class="btn btn-danger-soft" data-action="clear-data">Clear Business Data</button></div></div></section>`:""}
         </div>
         <section class="card span-2"><div class="card-head"><h3>Recent audit log</h3><span class="badge">Last 100 actions</span></div>
           ${db.auditLogs.length?`<div class="table-wrap"><table><thead><tr><th>Timestamp</th><th>Action</th><th>Record Type</th><th>Record ID</th><th>User</th></tr></thead><tbody>${db.auditLogs.slice(0,100).map(row=>`<tr><td>${dateTimeFmt(row.timestamp)}</td><td class="cell-main">${esc(row.action)}</td><td>${esc(statusLabel(row.recordType))}</td><td class="mono">${esc(row.recordId)}</td><td>${esc(row.user)}</td></tr>`).join("")}</tbody></table></div>`:emptyState("No audit entries","Important actions will be logged here.","reports")}
@@ -5794,10 +5794,10 @@
     const showUserEditor=async id=>{
       if(!isAdminRole()){toast("Admin access required","error");return;}
       const db=await dataService.getDatabase(),row=db.users.find(user=>user.id===id)||{},heads=db.users.filter(user=>user.role===ROLES.SALES_HEAD&&(user.status==="ACTIVE"||user.id===row.reportsToUserId));
-      showModal({title:id?"Edit User":"Create Firebase User",subtitle:"Firebase login, role and reporting hierarchy",size:"modal-lg",body:`<form id="user-form"><input type="hidden" name="id" value="${attr(row.id||"")}"><div class="grid grid-2"><div class="field"><label>Full Name <span class="required">*</span></label><input class="input" name="name" value="${attr(row.name||"")}" required></div><div class="field"><label>Login Email <span class="required">*</span></label><input class="input" type="email" name="email" value="${attr(row.email||"")}" placeholder="name@company.com" ${id?"readonly":"required"}><div class="help">${id?"Firebase Auth email cannot be changed from this profile editor.":"This creates the real Firebase Auth account."}</div></div>${id?"":`<div class="field"><label>Temporary Password <span class="required">*</span></label><input class="input" type="password" name="password" autocomplete="new-password" minlength="8" required><div class="help">At least 8 characters. Share it securely.</div></div>`}<div class="field"><label>Mobile</label><input class="input" name="mobile" value="${attr(row.mobile||"")}"></div><div class="field"><label>Role <span class="required">*</span></label><select class="select" name="role">${Object.values(ROLES).map(role=>`<option value="${role}" ${row.role===role?"selected":""}>${esc(roleLabel(role))}</option>`).join("")}</select></div><div class="field"><label>Reports To Sales Head</label><select class="select" name="reportsToUserId">${options(heads,row.reportsToUserId,user=>user.name+" · "+user.email,"Choose Sales Head")}</select><div class="help">Required only when Role is Salesman.</div></div><div class="field"><label>Status</label><select class="select" name="status"><option value="ACTIVE" ${row.status!=="INACTIVE"?"selected":""}>Active</option><option value="INACTIVE" ${row.status==="INACTIVE"?"selected":""}>Inactive</option></select></div></div><div class="callout"><strong>Access:</strong> authentication is handled by Firebase Email/Password. Sales Head and Salesman accounts open the compact field workspace.</div></form>`,footer:'<button class="btn" data-action="close-modal">Cancel</button><button class="btn btn-primary" type="submit" form="user-form">Save User</button>'});
+      showModal({title:id?"Edit User":"Create User",subtitle:"Login, role and reporting hierarchy",size:"modal-lg",body:`<form id="user-form"><input type="hidden" name="id" value="${attr(row.id||"")}"><div class="grid grid-2"><div class="field"><label>Full Name <span class="required">*</span></label><input class="input" name="name" value="${attr(row.name||"")}" required></div><div class="field"><label>Login Email <span class="required">*</span></label><input class="input" type="email" name="email" value="${attr(row.email||"")}" placeholder="name@company.com" ${id?"readonly":"required"}><div class="help">${id?"Login email cannot be changed from this profile.":"This email will be used to sign in."}</div></div>${id?"":`<div class="field"><label>Temporary Password <span class="required">*</span></label><input class="input" type="password" name="password" autocomplete="new-password" minlength="8" required><div class="help">At least 8 characters. Share it securely.</div></div>`}<div class="field"><label>Mobile</label><input class="input" name="mobile" value="${attr(row.mobile||"")}"></div><div class="field"><label>Role <span class="required">*</span></label><select class="select" name="role">${Object.values(ROLES).map(role=>`<option value="${role}" ${row.role===role?"selected":""}>${esc(roleLabel(role))}</option>`).join("")}</select></div><div class="field"><label>Reports To Sales Head</label><select class="select" name="reportsToUserId">${options(heads,row.reportsToUserId,user=>user.name+" · "+user.email,"Choose Sales Head")}</select><div class="help">Required only when Role is Salesman.</div></div><div class="field"><label>Status</label><select class="select" name="status"><option value="ACTIVE" ${row.status!=="INACTIVE"?"selected":""}>Active</option><option value="INACTIVE" ${row.status==="INACTIVE"?"selected":""}>Inactive</option></select></div></div><div class="callout"><strong>Access:</strong> use the login email and temporary password to sign in. Sales Head and Salesman accounts open the compact field workspace.</div></form>`,footer:'<button class="btn" data-action="close-modal">Cancel</button><button class="btn btn-primary" type="submit" form="user-form">Save User</button>'});
     };
     const showAccountMenu=()=>{
-      showModal({title:"Firebase Account",subtitle:firebaseAuth.currentUser?.email||"Signed-in user",body:`<div class="detail-grid"><div><span>Name</span><strong>${esc(currentUser?.name||"—")}</strong></div><div><span>Role</span><strong>${esc(roleLabel(currentRole))}</strong></div><div><span>Email</span><strong>${esc(firebaseAuth.currentUser?.email||currentUser?.email||"—")}</strong></div><div><span>Cloud status</span><strong>Connected</strong></div></div><div class="callout" style="margin-top:14px">Your session is secured by Firebase Authentication. Password reset instructions are sent to this email.</div>`,footer:'<button class="btn" data-action="send-password-reset">Send Password Reset</button><button class="btn btn-danger-soft" data-action="sign-out">Sign Out</button>'});
+      showModal({title:"My Account",subtitle:firebaseAuth.currentUser?.email||"Signed-in user",body:`<div class="detail-grid"><div><span>Name</span><strong>${esc(currentUser?.name||"—")}</strong></div><div><span>Role</span><strong>${esc(roleLabel(currentRole))}</strong></div><div><span>Email</span><strong>${esc(firebaseAuth.currentUser?.email||currentUser?.email||"—")}</strong></div><div><span>Status</span><strong>Active</strong></div></div><div class="callout" style="margin-top:14px">Password reset instructions will be sent to this email.</div>`,footer:'<button class="btn" data-action="send-password-reset">Send Password Reset</button><button class="btn btn-danger-soft" data-action="sign-out">Sign Out</button>'});
     };
     const showFieldOrderReject=async id=>{
       const db=await dataService.getDatabase(),order=db.fieldOrders.find(row=>row.id===id);
@@ -6026,7 +6026,7 @@
       }
       if(action==="reset-user-password"){
         const email=clean(element.dataset.email);if(!email)return;
-        const ok=await confirmAction({title:"Send password reset?",message:"Firebase will email a password-reset link to "+email+".",confirmLabel:"Send Reset Email"});
+        const ok=await confirmAction({title:"Send password reset?",message:"A password-reset link will be sent to "+email+".",confirmLabel:"Send Reset Email"});
         if(ok)await execute(()=>sendPasswordResetEmail(firebaseAuth,email),"Password reset email sent");return;
       }
       if(action==="open-aging"){state.inventoryAging=element.dataset.bucket;state.inventoryPage=1;navigate("inventory");}
@@ -6244,10 +6244,10 @@
         const json=await dataService.exportBackup();downloadFile("imei-flow-backup-"+localDateISO()+".json",json,"application/json");toast("Backup exported");
       }
       else if(action==="choose-backup"){const input=$("#backup-file");input.value="";input.click();}
-      else if(action==="refresh-cloud"){await execute(()=>dataService.refreshCloud(),"Cloud data refreshed",()=>renderRoute());}
+      else if(action==="refresh-cloud"){await execute(()=>dataService.refreshCloud(),"Data refreshed",()=>renderRoute());}
       else if(action==="clear-data"){
-        const ok=await confirmAction({title:"Clear cloud business data?",message:"All masters, purchases, IMEIs, activations, sales, returns, vouchers, notes and expenses will be deleted from Firestore. Company settings and Firebase user profiles will be kept. Export a backup first if needed.",confirmLabel:"Clear Cloud Data",danger:true});
-        if(ok){await execute(()=>dataService.clearAllData(),"Cloud business data cleared");resetDraftState();closeModal();await renderRoute();}
+        const ok=await confirmAction({title:"Clear business data?",message:"All masters, purchases, IMEIs, activations, sales, returns, vouchers, notes and expenses will be deleted. Company settings and user profiles will be kept. Export a backup first if needed.",confirmLabel:"Clear Business Data",danger:true});
+        if(ok){await execute(()=>dataService.clearAllData(),"Business data cleared");resetDraftState();closeModal();await renderRoute();}
       }
       else if(action==="global-result"){
         $("#global-suggestions").innerHTML="";$("#global-search").value="";
@@ -6605,7 +6605,7 @@
       const file=e.target.files[0];if(!file)return;
       try{
         const candidate=JSON.parse(await readFileText(file));
-        const ok=await confirmAction({title:"Restore cloud backup?",message:"Current Firestore business data will be replaced after validation. Firebase Auth users and their profiles will be preserved.",confirmLabel:"Restore Cloud Backup",danger:true});
+        const ok=await confirmAction({title:"Restore backup?",message:"Current business data will be replaced after validation. User accounts and profiles will be preserved.",confirmLabel:"Restore Backup",danger:true});
         if(!ok)return;
         await dataService.importBackup(candidate);resetDraftState();closeModal();toast("Backup restored");await renderRoute();
       }catch(error){console.error(error);toast(error.message||"Invalid backup file","error");}
@@ -6639,15 +6639,30 @@
     let startupPromise=null,startupUid="",pendingAuthMessage=null,profileUnsubscribe=null;
     const friendlyFirebaseError=error=>({
       "auth/invalid-credential":"Email or password is incorrect.",
-      "auth/user-not-found":"No Firebase user exists for this email.",
+      "auth/user-not-found":"Email or password is incorrect.",
       "auth/wrong-password":"Email or password is incorrect.",
-      "auth/email-already-in-use":"This email already has a Firebase account.",
+      "auth/email-already-in-use":"This email is already in use.",
       "auth/weak-password":"Use a stronger password with at least 8 characters.",
       "auth/too-many-requests":"Too many attempts. Please wait and try again.",
       "auth/network-request-failed":"Network connection failed. Check your internet connection.",
-      "permission-denied":"Firestore denied this operation. Publish the supplied security rules.",
-      "failed-precondition":"Create the Firestore database in Firebase Console first."
-    })[error?.code]||error?.message||"Firebase operation failed.";
+      "permission-denied":"You do not have permission to complete this action.",
+      "failed-precondition":"This service is not ready. Contact the Administrator."
+    })[error?.code]||error?.message||"Something went wrong. Please try again.";
+    const friendlySignInError=error=>({
+      "auth/invalid-credential":"Email or password is incorrect.",
+      "auth/user-not-found":"Email or password is incorrect.",
+      "auth/wrong-password":"Email or password is incorrect.",
+      "auth/too-many-requests":"Too many attempts. Please wait and try again.",
+      "auth/network-request-failed":"Please check your internet connection and try again.",
+      "permission-denied":"You do not have access. Contact the Administrator.",
+      "failed-precondition":"Your account cannot be opened right now. Contact the Administrator."
+    })[error?.code]||([
+      "Your account is not ready. Contact the Administrator.",
+      "The application needs an update. Contact the Administrator.",
+      "Your account is inactive. Contact the Administrator.",
+      "Your account is not set up. Contact the Administrator.",
+      "Your account could not be loaded. Contact the Administrator."
+    ].includes(error?.message)?error.message:"Unable to sign in right now. Please try again.");
     const setAuthMessage=(message="",type="")=>{
       const node=$("#auth-status");node.textContent=message;node.className="auth-status"+(message?" show":"")+(type?" "+type:"");
     };
@@ -6664,16 +6679,16 @@
     };
     const loadFirebaseProfile=async uidValue=>{
       const snapshot=await getDoc(doc(companyCollection("users"),uidValue));
-      if(!snapshot.exists())throw new Error("This Firebase account has no INFINIAA user profile. Ask an Admin to create or restore it.");
+      if(!snapshot.exists())throw new Error("Your account is not set up. Contact the Administrator.");
       const profile=snapshot.data();
-      if(profile.status!=="ACTIVE")throw new Error("This INFINIAA user profile is inactive. Contact an Admin.");
+      if(profile.status!=="ACTIVE")throw new Error("Your account is inactive. Contact the Administrator.");
       if(!Object.values(ROLES).includes(profile.role))throw new Error("This user profile has an invalid role.");
       return profile;
     };
     const handleLiveCloudRefresh=async()=>{
       const db=await dataService.getDatabase(),profile=db.users.find(user=>user.id===firebaseAuth.currentUser?.uid);
       if(!profile||profile.status!=="ACTIVE"){
-        pendingAuthMessage={message:"Your INFINIAA user profile is no longer active.",type:"error"};
+        pendingAuthMessage={message:"Your account is no longer active. Contact the Administrator.",type:"error"};
         await signOut(firebaseAuth);return;
       }
       currentUser=profile;currentUserId=profile.id;currentRole=profile.role;applyRole();
@@ -6688,7 +6703,7 @@
         currentUser=profile;currentUserId=profile.id;currentRole=profile.role;
         await dataService.initialize();
         const db=await dataService.getDatabase(),cloudProfile=db.users.find(item=>item.id===user.uid&&item.status==="ACTIVE");
-        if(!cloudProfile)throw new Error("Your active Firebase profile was not found in the cloud workspace.");
+        if(!cloudProfile)throw new Error("Your account could not be loaded. Contact the Administrator.");
         currentUser=cloudProfile;currentRole=cloudProfile.role;
         $("#auth-gate").hidden=true;$("#app-shell").hidden=false;setAuthMessage();
         const savedTheme=window.localStorage.getItem(THEME_KEY);
@@ -6701,7 +6716,7 @@
         profileUnsubscribe=onSnapshot(doc(companyCollection("users"),user.uid),async snapshot=>{
           const latest=snapshot.exists()?snapshot.data():null;
           if(!latest||latest.status!=="ACTIVE"){
-            pendingAuthMessage={message:"Your INFINIAA user profile is inactive or no longer exists.",type:"error"};
+            pendingAuthMessage={message:"Your account is inactive or no longer available. Contact the Administrator.",type:"error"};
             await signOut(firebaseAuth);return;
           }
           if(currentUser&&(latest.role!==currentRole||latest.name!==currentUser.name)){
@@ -6715,19 +6730,19 @@
     };
     $("#login-form").addEventListener("submit",async event=>{
       event.preventDefault();const form=event.currentTarget,values=formObject(form);
-      setFormBusy(form,true);setAuthMessage("Signing in to Firebase…");
+      setFormBusy(form,true);setAuthMessage("Signing in…");
       try{await authPersistenceReady;await signInWithEmailAndPassword(firebaseAuth,lower(values.email),values.password);}
-      catch(error){setAuthMessage(friendlyFirebaseError(error),"error");}
+      catch(error){setAuthMessage(friendlySignInError(error),"error");}
       finally{setFormBusy(form,false);}
     });
     hydrateIcons();
     applyTheme(window.localStorage.getItem(THEME_KEY)==="dark");
     authPersistenceReady.then(()=>onAuthStateChanged(firebaseAuth,async user=>{
       if(!user){const notice=pendingAuthMessage;pendingAuthMessage=null;showSignedOut(notice?.message||"",notice?.type||"");return;}
-      setAuthMessage("Loading your cloud workspace…");
+      setAuthMessage("Opening your account…");
       try{await startAuthenticatedApp(user);}
-      catch(error){console.error(error);pendingAuthMessage={message:friendlyFirebaseError(error),type:"error"};await signOut(firebaseAuth);}
-    })).catch(error=>showSignedOut(friendlyFirebaseError(error),"error"));
+      catch(error){console.error(error);pendingAuthMessage={message:friendlySignInError(error),type:"error"};await signOut(firebaseAuth);}
+    })).catch(error=>showSignedOut(friendlySignInError(error),"error"));
   })();
   </script>
 </body>
